@@ -39,6 +39,7 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 | ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c claude -g "group"` + "`" + ` | Create new Claude session |
 | ` + "`" + `agent-deck -p <PROFILE> launch <path> -t "Title" -c claude -g "group" -m "prompt"` + "`" + ` | Create + start + send initial prompt in one command (preferred for new task sessions) |
 | ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c claude --worktree feature/branch -b` + "`" + ` | Create session with new worktree |
+| ` + "`" + `agent-deck -p <PROFILE> rename <id_or_title> "New Title"` + "`" + ` | Rename a session |
 
 ### Session Resolution
 Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**, or **fuzzy match**.
@@ -76,6 +77,22 @@ NEED: api-fix - asking whether to run integration tests against staging or prod
 ` + "```" + `
 
 The bridge parses your response: if it contains ` + "`" + `NEED:` + "`" + ` lines, those get sent to the user via Telegram and/or Slack.
+
+### Title Refresh
+
+During heartbeats, check whether each session's title still reflects what it is actually doing.
+Read the session's recent output (` + "`" + `session output <id> -q` + "`" + `) and compare against its current title.
+If the title is **obviously wrong or stale** (e.g. the session was titled "Fix login bug" but is now refactoring the payment module), rename it:
+
+` + "```" + `
+agent-deck -p <PROFILE> rename <id_or_title> "New descriptive title"
+` + "```" + `
+
+**Guidelines:**
+- Only rename when there is a clear mismatch. Minor scope drift does not warrant a rename.
+- Keep titles short (3-6 words) and descriptive of the current task.
+- Do not rename conductor sessions.
+- Include renames in your ` + "`" + `[STATUS]` + "`" + ` response as ` + "`" + `RENAMED:` + "`" + ` lines, e.g. ` + "`" + `RENAMED: "Fix login bug" → "Refactor payment module"` + "`" + `.
 
 ## State Management
 
@@ -1035,8 +1052,8 @@ def create_telegram_bot(config: dict):
         if not message.text:
             return
 
-        conductor_names = get_conductor_names()
         conductors = discover_conductors()
+        conductor_names = [c["name"] for c in conductors]
 
         # Determine target conductor from message prefix
         target_name, cleaned_msg = parse_conductor_prefix(
@@ -1170,57 +1187,69 @@ def create_slack_app(config: dict):
             log.error("Slack say() failed: %s", e)
 
     async def _handle_slack_text(text: str, say, thread_ts: str = None):
-        """Shared handler for Slack messages and mentions."""
-        conductor_names = get_conductor_names()
-        conductors = discover_conductors()
+        """Dispatch Slack message to a background task immediately.
 
-        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
+        Returns right away so the Socket Mode client can read and ack
+        the next event envelope without waiting for file I/O or Slack
+        API calls.
+        """
+        asyncio.create_task(_do_handle_slack_text(text, say, thread_ts))
 
-        target = None
-        if target_name:
-            for c in conductors:
-                if c["name"] == target_name:
-                    target = c
-                    break
-        if target is None:
-            target = get_default_conductor()
-        if target is None:
-            await _safe_say(
-                say,
-                text="[No conductors configured. Run: agent-deck conductor setup <name>]",
-                thread_ts=thread_ts,
-            )
-            return
+    async def _do_handle_slack_text(text: str, say, thread_ts: str = None):
+        """Process a Slack message (runs as a background task)."""
+        try:
+            conductors = discover_conductors()
+            conductor_names = [c["name"] for c in conductors]
 
-        if not cleaned_msg:
-            cleaned_msg = text
+            target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
 
-        session_title = conductor_session_title(target["name"])
-        profile = target["profile"]
-
-        name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
-
-        # Ack immediately with typing indicator
-        log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
-        await _safe_say(say, text=f"{name_tag}...", thread_ts=thread_ts)
-
-        # Response callback (called by queue worker when conductor replies)
-        async def on_slack_response(ok, response, _tag=name_tag, _say=say, _tts=thread_ts, _name=target["name"]):
-            if not ok:
-                await _safe_say(_say, text=f"[Failed: {response}]", thread_ts=_tts)
+            target = None
+            if target_name:
+                for c in conductors:
+                    if c["name"] == target_name:
+                        target = c
+                        break
+            if target is None:
+                target = get_default_conductor()
+            if target is None:
+                await _safe_say(
+                    say,
+                    text="[No conductors configured. Run: agent-deck conductor setup <name>]",
+                    thread_ts=thread_ts,
+                )
                 return
-            log.info("Conductor [%s] response: %s", _name, response[:100])
-            for chunk in split_message(response, max_len=SLACK_MAX_LENGTH):
-                prefixed = f"{_tag}{chunk}" if _tag else chunk
-                await _safe_say(_say, text=prefixed, thread_ts=_tts)
 
-        _enqueue_conductor_message(
-            conductor_name=target["name"],
-            session_title=session_title,
-            profile=profile,
-            message=cleaned_msg,
-            on_response=on_slack_response,
-        )
+            if not cleaned_msg:
+                cleaned_msg = text
+
+            session_title = conductor_session_title(target["name"])
+            profile = target["profile"]
+
+            name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+
+            # Ack with typing indicator
+            log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
+            await _safe_say(say, text=f"{name_tag}...", thread_ts=thread_ts)
+
+            # Response callback (called by queue worker when conductor replies)
+            async def on_slack_response(ok, response, _tag=name_tag, _say=say, _tts=thread_ts, _name=target["name"]):
+                if not ok:
+                    await _safe_say(_say, text=f"[Failed: {response}]", thread_ts=_tts)
+                    return
+                log.info("Conductor [%s] response: %s", _name, response[:100])
+                for chunk in split_message(response, max_len=SLACK_MAX_LENGTH):
+                    prefixed = f"{_tag}{chunk}" if _tag else chunk
+                    await _safe_say(_say, text=prefixed, thread_ts=_tts)
+
+            _enqueue_conductor_message(
+                conductor_name=target["name"],
+                session_title=session_title,
+                profile=profile,
+                message=cleaned_msg,
+                on_response=on_slack_response,
+            )
+        except Exception as e:
+            log.error("Slack message handler error: %s", e)
 
     @app.event("message")
     async def handle_slack_message(event, say):
