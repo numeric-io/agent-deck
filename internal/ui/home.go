@@ -166,6 +166,7 @@ type Home struct {
 	geminiModelDialog    *GeminiModelDialog    // For selecting Gemini model
 	sessionPickerDialog  *SessionPickerDialog  // For sending output to another session
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
+	notesDialog          *NotesDialog          // For editing group notes
 
 	// Analytics cache (async fetching with TTL)
 	currentAnalytics       *session.SessionAnalytics                  // Current analytics for selected session (Claude)
@@ -543,6 +544,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		geminiModelDialog:    NewGeminiModelDialog(),
 		sessionPickerDialog:  NewSessionPickerDialog(),
 		worktreeFinishDialog: NewWorktreeFinishDialog(),
+		notesDialog:          NewNotesDialog(),
 		cursor:               0,
 		initialLoading:       true, // Show splash until sessions load
 		ctx:                  ctx,
@@ -905,6 +907,23 @@ func (h *Home) restoreState(state reloadState) {
 func (h *Home) rebuildFlatItems() {
 	allItems := h.groupTree.Flatten()
 
+	// Inject a notes item after each expanded group header
+	withNotes := make([]session.Item, 0, len(allItems)*2)
+	for _, item := range allItems {
+		withNotes = append(withNotes, item)
+		if item.Type == session.ItemTypeGroup && item.Group != nil && item.Group.Expanded {
+			notes := session.LoadGroupNotes(h.profile, item.Group.Path)
+			withNotes = append(withNotes, session.Item{
+				Type:  session.ItemTypeNotes,
+				Group: item.Group,
+				Level: item.Level + 1,
+				Path:  item.Group.Path,
+				Notes: session.NotesPreview(notes),
+			})
+		}
+	}
+	allItems = withNotes
+
 	// Apply status filter if active
 	if h.statusFilter != "" {
 		// First pass: identify groups that have matching sessions
@@ -929,6 +948,11 @@ func (h *Home) rebuildFlatItems() {
 		for _, item := range allItems {
 			if item.Type == session.ItemTypeGroup {
 				// Keep group if it has matching sessions
+				if groupsWithMatches[item.Path] {
+					filtered = append(filtered, item)
+				}
+			} else if item.Type == session.ItemTypeNotes {
+				// Keep notes if their group is shown
 				if groupsWithMatches[item.Path] {
 					filtered = append(filtered, item)
 				}
@@ -3398,6 +3422,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.worktreeFinishDialog.IsVisible() {
 			return h.handleWorktreeFinishDialogKey(msg)
 		}
+		if h.notesDialog.IsVisible() {
+			return h.handleNotesDialogKey(msg)
+		}
 
 		// Main view keys
 		return h.handleMainKey(msg)
@@ -3835,6 +3862,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.resumingSessions[item.Session.ID] = time.Now()
 					return h, h.restartSession(item.Session)
 				}
+			} else if item.Type == session.ItemTypeNotes {
+				// Open notes editor
+				groupName := item.Path
+				if item.Group != nil {
+					groupName = item.Group.Name
+				}
+				notes := session.LoadGroupNotes(h.profile, item.Path)
+				h.notesDialog.Show(item.Path, groupName, notes)
 			} else if item.Type == session.ItemTypeGroup {
 				// Toggle group on enter
 				groupPath := item.Path
@@ -5775,6 +5810,7 @@ func (h *Home) updateSizes() {
 	h.confirmDialog.SetSize(h.width, h.height)
 	h.geminiModelDialog.SetSize(h.width, h.height)
 	h.worktreeFinishDialog.SetSize(h.width, h.height)
+	h.notesDialog.SetSize(h.width, h.height)
 }
 
 // View renders the UI
@@ -5860,6 +5896,9 @@ func (h *Home) View() string {
 	}
 	if h.worktreeFinishDialog.IsVisible() {
 		return h.worktreeFinishDialog.View()
+	}
+	if h.notesDialog.IsVisible() {
+		return h.notesDialog.View()
 	}
 
 	// Reuse viewBuilder to reduce allocations (reset and pre-allocate)
@@ -7111,10 +7150,12 @@ func (h *Home) renderSessionList(width, height int) string {
 	return b.String()
 }
 
-// renderItem renders a single item (group or session) for the left panel
+// renderItem renders a single item (group, notes, or session) for the left panel
 func (h *Home) renderItem(b *strings.Builder, item session.Item, selected bool, itemIndex int) {
 	if item.Type == session.ItemTypeGroup {
 		h.renderGroupItem(b, item, selected, itemIndex)
+	} else if item.Type == session.ItemTypeNotes {
+		h.renderNotesItem(b, item, selected)
 	} else {
 		h.renderSessionItem(b, item, selected)
 	}
@@ -7203,6 +7244,30 @@ func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected b
 	)
 	b.WriteString(row)
 	b.WriteString("\n")
+}
+
+// renderNotesItem renders the notes entry under a group header
+func (h *Home) renderNotesItem(b *strings.Builder, item session.Item, selected bool) {
+	// Indentation matching session items within the same group
+	indent := strings.Repeat(strings.Repeat(" ", spacingNormal), max(0, item.Level))
+
+	connector := TreeConnectorStyle.Render(treeBranch)
+
+	// Icon + preview text
+	preview := item.Notes
+	if preview == "" {
+		preview = "Add notes..."
+	}
+
+	var text string
+	if selected {
+		style := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+		text = style.Render("\U0001F4DD " + preview)
+	} else {
+		text = DimStyle.Render("\U0001F4DD " + preview)
+	}
+
+	b.WriteString(fmt.Sprintf("%s%s %s\n", indent, connector, text))
 }
 
 // Tree drawing characters for visual hierarchy
@@ -7699,6 +7764,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	// If group is selected, show group info
 	if item.Type == session.ItemTypeGroup {
 		return h.renderGroupPreview(item.Group, width, height)
+	}
+
+	if item.Type == session.ItemTypeNotes {
+		return h.renderNotesPreview(item, width, height)
 	}
 
 	// Session preview
@@ -8591,6 +8660,31 @@ func formatRelativeTime(t time.Time) string {
 }
 
 // renderGroupPreview renders the preview pane for a group
+func (h *Home) renderNotesPreview(item session.Item, width, height int) string {
+	var b strings.Builder
+
+	groupName := item.Path
+	if item.Group != nil {
+		groupName = item.Group.Name
+	}
+
+	headerStyle := lipgloss.NewStyle().
+		Foreground(ColorCyan).
+		Bold(true)
+	b.WriteString(headerStyle.Render("\U0001F4DD Notes: " + groupName))
+	b.WriteString("\n\n")
+
+	notes := session.LoadGroupNotes(h.profile, item.Path)
+	if notes == "" {
+		b.WriteString(DimStyle.Render("No notes yet. Press Enter to add notes."))
+	} else {
+		b.WriteString(lipgloss.NewStyle().Foreground(ColorText).Render(notes))
+	}
+	b.WriteString("\n")
+
+	return b.String()
+}
+
 func (h *Home) renderGroupPreview(group *session.Group, width, height int) string {
 	var b strings.Builder
 
@@ -8924,6 +9018,28 @@ func (h *Home) handleWorktreeFinishDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd
 	}
 
 	return h, nil
+}
+
+// handleNotesDialogKey handles keys when the notes dialog is visible
+func (h *Home) handleNotesDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+s":
+		// Save notes
+		content := h.notesDialog.Value()
+		groupPath := h.notesDialog.GroupPath()
+		_ = session.SaveGroupNotes(h.profile, groupPath, content)
+		h.notesDialog.Hide()
+		h.rebuildFlatItems()
+		return h, nil
+	case "esc":
+		h.notesDialog.Hide()
+		return h, nil
+	}
+
+	// Forward to textarea
+	var cmd tea.Cmd
+	h.notesDialog, cmd = h.notesDialog.Update(msg)
+	return h, cmd
 }
 
 // finishWorktree performs the worktree finish operation asynchronously:

@@ -22,6 +22,7 @@ type ItemType int
 const (
 	ItemTypeGroup ItemType = iota
 	ItemTypeSession
+	ItemTypeNotes
 )
 
 // Item represents a single item in the flattened group tree view
@@ -36,6 +37,7 @@ type Item struct {
 	IsSubSession        bool   // True if this session has a parent session
 	IsLastSubSession    bool   // True if this is the last sub-session of its parent (for tree rendering)
 	ParentIsLastInGroup bool   // True if parent session is last top-level item (for tree line rendering)
+	Notes               string // Preview text for notes items
 }
 
 // Group represents a group of sessions
