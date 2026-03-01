@@ -784,6 +784,89 @@ def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-conductor message queue
+# ---------------------------------------------------------------------------
+
+_conductor_queues: dict[str, asyncio.Queue] = {}
+_conductor_workers: dict[str, asyncio.Task] = {}
+
+
+class _QueueItem:
+    """A message queued for delivery to a conductor."""
+    __slots__ = ("message", "conductor_name", "session_title", "profile", "on_response")
+    def __init__(self, message, conductor_name, session_title, profile, on_response):
+        self.message = message
+        self.conductor_name = conductor_name
+        self.session_title = session_title
+        self.profile = profile
+        self.on_response = on_response
+
+
+def _send_with_ensure(conductor_name, session_title, profile, message):
+    """Blocking: ensure conductor is running, then send message.
+
+    Intended to be called via asyncio.to_thread() from the queue worker.
+    """
+    if not ensure_conductor_running(conductor_name, profile):
+        return False, f"[Could not start conductor {conductor_name}. Check agent-deck.]"
+    return send_to_conductor(
+        session_title, message, profile=profile,
+        wait_for_reply=True, response_timeout=RESPONSE_TIMEOUT,
+    )
+
+
+async def _conductor_worker(name: str, queue: asyncio.Queue):
+    """Process messages for a single conductor sequentially in FIFO order."""
+    log.info("Queue worker started for conductor [%s]", name)
+    while True:
+        item = await queue.get()
+        try:
+            ok, response = await asyncio.to_thread(
+                _send_with_ensure,
+                item.conductor_name, item.session_title,
+                item.profile, item.message,
+            )
+            await item.on_response(ok, response)
+        except Exception as e:
+            log.error("Queue worker [%s] error: %s", name, e)
+            try:
+                await item.on_response(False, f"[Internal error: {e}]")
+            except Exception:
+                pass
+        finally:
+            queue.task_done()
+
+
+def _enqueue_conductor_message(
+    conductor_name: str,
+    session_title: str,
+    profile: str,
+    message: str,
+    on_response,
+):
+    """Enqueue a message for a conductor. Creates worker task if needed.
+
+    Messages for the same conductor are processed sequentially (FIFO).
+    Different conductors process in parallel.
+    """
+    if conductor_name not in _conductor_queues:
+        q = asyncio.Queue()
+        _conductor_queues[conductor_name] = q
+        _conductor_workers[conductor_name] = asyncio.create_task(
+            _conductor_worker(conductor_name, q)
+        )
+    _conductor_queues[conductor_name].put_nowait(
+        _QueueItem(
+            message=message,
+            conductor_name=conductor_name,
+            session_title=session_title,
+            profile=profile,
+            on_response=on_response,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Telegram bot setup
 # ---------------------------------------------------------------------------
 
@@ -978,41 +1061,31 @@ def create_telegram_bot(config: dict):
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
 
-        # Ensure conductor is running
-        if not ensure_conductor_running(target["name"], profile):
-            await message.answer(
-                f"[Could not start conductor {target['name']}. Check agent-deck.]"
-            )
-            return
-
-        # Send to conductor
-        log.info(
-            "User message -> [%s]: %s", target["name"], cleaned_msg[:100]
-        )
-        ok, response = send_to_conductor(
-            session_title,
-            cleaned_msg,
-            profile=profile,
-            wait_for_reply=True,
-            response_timeout=RESPONSE_TIMEOUT,
-        )
-        if not ok:
-            await message.answer(
-                f"[Failed to send message to conductor {target['name']}.]"
-            )
-            return
-
-        # Response is returned directly by session send --wait.
         name_tag = (
             f"[{target['name']}] " if len(conductors) > 1 else ""
         )
-        await message.answer(f"{name_tag}...")  # typing indicator
-        log.info("Conductor [%s] response: %s", target["name"], response[:100])
 
-        # Send response back (split if needed)
-        for chunk in split_message(response):
-            prefixed = f"{name_tag}{chunk}" if name_tag else chunk
-            await message.answer(prefixed)
+        # Ack immediately with typing indicator
+        log.info("User message -> [%s]: %s", target["name"], cleaned_msg[:100])
+        await message.answer(f"{name_tag}...")
+
+        # Response callback (called by queue worker when conductor replies)
+        async def on_tg_response(ok, response, _tag=name_tag, _msg=message, _name=target["name"]):
+            if not ok:
+                await _msg.answer(f"[Failed: {response}]")
+                return
+            log.info("Conductor [%s] response: %s", _name, response[:100])
+            for chunk in split_message(response):
+                prefixed = f"{_tag}{chunk}" if _tag else chunk
+                await _msg.answer(prefixed)
+
+        _enqueue_conductor_message(
+            conductor_name=target["name"],
+            session_title=session_title,
+            profile=profile,
+            message=cleaned_msg,
+            on_response=on_tg_response,
+        )
 
     return bot, dp
 
@@ -1125,39 +1198,29 @@ def create_slack_app(config: dict):
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
 
-        if not ensure_conductor_running(target["name"], profile):
-            await _safe_say(
-                say,
-                text=f"[Could not start conductor {target['name']}. Check agent-deck.]",
-                thread_ts=thread_ts,
-            )
-            return
-
-        log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
-        ok, response = send_to_conductor(
-            session_title,
-            cleaned_msg,
-            profile=profile,
-            wait_for_reply=True,
-            response_timeout=RESPONSE_TIMEOUT,
-        )
-        if not ok:
-            await _safe_say(
-                say,
-                text=f"[Failed to send message to conductor {target['name']}.]",
-                thread_ts=thread_ts,
-            )
-            return
-
         name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+
+        # Ack immediately with typing indicator
+        log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
         await _safe_say(say, text=f"{name_tag}...", thread_ts=thread_ts)
 
-        # Response is returned directly by session send --wait.
-        log.info("Conductor [%s] response: %s", target["name"], response[:100])
+        # Response callback (called by queue worker when conductor replies)
+        async def on_slack_response(ok, response, _tag=name_tag, _say=say, _tts=thread_ts, _name=target["name"]):
+            if not ok:
+                await _safe_say(_say, text=f"[Failed: {response}]", thread_ts=_tts)
+                return
+            log.info("Conductor [%s] response: %s", _name, response[:100])
+            for chunk in split_message(response, max_len=SLACK_MAX_LENGTH):
+                prefixed = f"{_tag}{chunk}" if _tag else chunk
+                await _safe_say(_say, text=prefixed, thread_ts=_tts)
 
-        for chunk in split_message(response, max_len=SLACK_MAX_LENGTH):
-            prefixed = f"{name_tag}{chunk}" if name_tag else chunk
-            await _safe_say(say, text=prefixed, thread_ts=thread_ts)
+        _enqueue_conductor_message(
+            conductor_name=target["name"],
+            session_title=session_title,
+            profile=profile,
+            message=cleaned_msg,
+            on_response=on_slack_response,
+        )
 
     @app.event("message")
     async def handle_slack_message(event, say):
@@ -1419,26 +1482,26 @@ async def heartbeat_loop(config: dict, telegram_bot=None, slack_app=None, slack_
 
                 heartbeat_msg = " ".join(parts)
 
-                # Ensure conductor is running
-                if not ensure_conductor_running(name, profile):
-                    log.error(
-                        "Heartbeat [%s]: conductor not running, skipping",
-                        name,
-                    )
-                    continue
+                # Send heartbeat via conductor queue (serialized with user messages)
+                hb_future = asyncio.get_running_loop().create_future()
 
-                # Send heartbeat to conductor
-                ok, response = send_to_conductor(
-                    session_title,
-                    heartbeat_msg,
+                async def _on_hb(ok, resp, _fut=hb_future):
+                    if not _fut.done():
+                        _fut.set_result((ok, resp))
+
+                _enqueue_conductor_message(
+                    conductor_name=name,
+                    session_title=session_title,
                     profile=profile,
-                    wait_for_reply=True,
-                    response_timeout=RESPONSE_TIMEOUT,
+                    message=heartbeat_msg,
+                    on_response=_on_hb,
                 )
+
+                ok, response = await hb_future
                 if not ok:
                     log.error(
-                        "Heartbeat [%s]: failed to send to conductor",
-                        name,
+                        "Heartbeat [%s]: failed (%s)",
+                        name, response[:100],
                     )
                     continue
 
