@@ -164,7 +164,8 @@ type Home struct {
 	settingsPanel        *SettingsPanel        // For editing settings
 	analyticsPanel       *AnalyticsPanel       // For displaying session analytics
 	geminiModelDialog    *GeminiModelDialog    // For selecting Gemini model
-	sessionPickerDialog  *SessionPickerDialog  // For sending output to another session
+	sessionPickerDialog   *SessionPickerDialog   // For sending output to another session
+	conductorPickerDialog *ConductorPickerDialog // For starting a conductor from TUI
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
 	notesDialog          *NotesDialog          // For editing group notes
 
@@ -182,6 +183,7 @@ type Home struct {
 	cursor         int            // Selected item index in flatItems
 	viewOffset     int            // First visible item index (for scrolling)
 	isAttaching    atomic.Bool    // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
+	attachedSessID atomic.Value   // Stores the session ID (string) currently attached via tea.Exec
 	statusFilter   session.Status // Filter sessions by status ("" = all, or specific status)
 	previewMode    PreviewMode    // What to show in preview pane (both, output-only, analytics-only)
 	err            error
@@ -553,7 +555,8 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		settingsPanel:        NewSettingsPanel(),
 		analyticsPanel:       NewAnalyticsPanel(),
 		geminiModelDialog:    NewGeminiModelDialog(),
-		sessionPickerDialog:  NewSessionPickerDialog(),
+		sessionPickerDialog:   NewSessionPickerDialog(),
+		conductorPickerDialog: NewConductorPickerDialog(),
 		worktreeFinishDialog: NewWorktreeFinishDialog(),
 		notesDialog:          NewNotesDialog(),
 		cursor:               0,
@@ -918,11 +921,17 @@ func (h *Home) restoreState(state reloadState) {
 func (h *Home) rebuildFlatItems() {
 	allItems := h.groupTree.Flatten()
 
-	// Inject a notes item after each expanded group header
+	// Hide default group when empty; inject notes items for non-default groups
 	withNotes := make([]session.Item, 0, len(allItems)*2)
 	for _, item := range allItems {
+		isDefault := item.Path == session.DefaultGroupPath
+		// Skip empty default group header
+		if isDefault && item.Type == session.ItemTypeGroup && item.Group != nil && len(item.Group.Sessions) == 0 {
+			continue
+		}
 		withNotes = append(withNotes, item)
-		if item.Type == session.ItemTypeGroup && item.Group != nil && item.Group.Expanded {
+		// Inject notes after expanded non-default group headers
+		if item.Type == session.ItemTypeGroup && item.Group != nil && item.Group.Expanded && !isDefault {
 			notes := session.LoadGroupNotes(h.profile, item.Group.Path)
 			withNotes = append(withNotes, session.Item{
 				Type:  session.ItemTypeNotes,
@@ -2114,19 +2123,55 @@ func (h *Home) syncNotificationsBackground() {
 	// Detect currently attached session (may be the user's session during tea.Exec)
 	currentSessionID := h.getAttachedSessionID()
 
+	// Fallback: use stored attached session ID when tmux detection fails during tea.Exec
+	if currentSessionID == "" {
+		if stored, ok := h.attachedSessID.Load().(string); ok && stored != "" {
+			currentSessionID = stored
+		}
+	}
+
 	// Signal file takes priority for determining "current" session
 	if sessionToAcknowledgeID != "" {
 		currentSessionID = sessionToAcknowledgeID
 	}
 
+	// Filter to same-group sessions (fall back to all if current session unknown)
+	groupInstances := instances
+	currentGroupPath := ""
+	if currentSessionID != "" {
+		h.instancesMu.RLock()
+		if inst, ok := h.instanceByID[currentSessionID]; ok {
+			currentGroupPath = inst.GroupPath
+			if currentGroupPath == "" {
+				currentGroupPath = session.DefaultGroupPath
+			}
+		}
+		h.instancesMu.RUnlock()
+
+		if currentGroupPath != "" {
+			groupInstances = make([]*session.Instance, 0, len(instances))
+			for _, inst := range instances {
+				gp := inst.GroupPath
+				if gp == "" {
+					gp = session.DefaultGroupPath
+				}
+				if gp == currentGroupPath {
+					groupInstances = append(groupInstances, inst)
+				}
+			}
+		}
+	}
+
 	notifLog.Debug(
 		"sync_state",
 		slog.String("current_session_id", currentSessionID),
-		slog.Int("instances", len(instances)),
+		slog.String("current_group", currentGroupPath),
+		slog.Int("total_instances", len(instances)),
+		slog.Int("group_instances", len(groupInstances)),
 	)
 
 	// Sync notification manager with current states
-	h.notificationManager.SyncFromInstances(instances, currentSessionID)
+	h.notificationManager.SyncFromInstances(groupInstances, currentSessionID, currentGroupPath != "")
 
 	// Update tmux status bar directly
 	barText := h.notificationManager.FormatBar()
@@ -2965,6 +3010,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusUpdateMsg:
 		// Clear attach flag - we've returned from the attached session
 		h.isAttaching.Store(false) // Atomic store for thread safety
+		h.attachedSessID.Store("")
 
 		// Trigger status update on attach return to reflect current state
 		// Acknowledgment was already done on attach (if session was waiting),
@@ -3513,6 +3559,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.sessionPickerDialog.IsVisible() {
 			return h.handleSessionPickerDialogKey(msg)
 		}
+		if h.conductorPickerDialog.IsVisible() {
+			return h.handleConductorPickerDialogKey(msg)
+		}
 		if h.worktreeFinishDialog.IsVisible() {
 			return h.handleWorktreeFinishDialogKey(msg)
 		}
@@ -3949,6 +3998,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						return h, nil
 					}
 					h.isAttaching.Store(true) // Prevent View() output during transition (atomic)
+					h.attachedSessID.Store(item.Session.ID)
 					return h, h.attachSession(item.Session)
 				}
 				// Session exited (tmux session gone) — auto-restart it.
@@ -4273,6 +4323,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
+		// If cursor is in conductor group, show conductor picker instead
+		if h.getCurrentGroupPath() == "conductor" {
+			conductors, err := session.ListConductors()
+			if err == nil && len(conductors) > 0 {
+				runningNames := make(map[string]bool)
+				h.instancesMu.RLock()
+				for _, inst := range h.instances {
+					if inst.GroupPath == "conductor" && inst.Exists() {
+						runningNames[inst.Title] = true
+					}
+				}
+				h.instancesMu.RUnlock()
+				h.conductorPickerDialog.SetSize(h.width, h.height)
+				h.conductorPickerDialog.Show(conductors, runningNames)
+				return h, nil
+			}
+		}
 		// Collect unique project paths sorted by most recently accessed
 		type pathInfo struct {
 			path           string
@@ -4901,7 +4968,20 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case GroupDialogRename:
 			name := h.groupDialog.GetValue()
 			if name != "" {
-				h.groupTree.RenameGroup(h.groupDialog.GetGroupPath(), name)
+				oldPath := h.groupDialog.GetGroupPath()
+				// Snapshot existing paths so we can detect the new path after rename
+				pathsBefore := make(map[string]bool, len(h.groupTree.Groups))
+				for p := range h.groupTree.Groups {
+					pathsBefore[p] = true
+				}
+				h.groupTree.RenameGroup(oldPath, name)
+				// Find the newly created path and move the notes files
+				for p := range h.groupTree.Groups {
+					if !pathsBefore[p] {
+						session.RenameGroupNotes(h.profile, oldPath, p)
+						break
+					}
+				}
 				h.instancesMu.Lock()
 				h.instances = h.groupTree.GetAllInstances()
 				h.instancesMu.Unlock()
@@ -6060,6 +6140,9 @@ func (h *Home) View() string {
 	}
 	if h.sessionPickerDialog.IsVisible() {
 		return h.sessionPickerDialog.View()
+	}
+	if h.conductorPickerDialog.IsVisible() {
+		return h.conductorPickerDialog.View()
 	}
 	if h.worktreeFinishDialog.IsVisible() {
 		return h.worktreeFinishDialog.View()
@@ -9335,6 +9418,52 @@ func (h *Home) handleSessionPickerDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd)
 		h.sessionPickerDialog.Update(msg)
 		return h, nil
 	}
+}
+
+// handleConductorPickerDialogKey handles key events when the conductor picker is visible.
+func (h *Home) handleConductorPickerDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		selected := h.conductorPickerDialog.GetSelected()
+		h.conductorPickerDialog.Hide()
+		if selected != nil {
+			return h, h.startConductorSession(selected)
+		}
+		return h, nil
+	case "esc":
+		h.conductorPickerDialog.Hide()
+		return h, nil
+	default:
+		h.conductorPickerDialog.Update(msg)
+		return h, nil
+	}
+}
+
+// startConductorSession starts or restarts a conductor session from its metadata.
+func (h *Home) startConductorSession(meta *session.ConductorMeta) tea.Cmd {
+	sessionTitle := session.ConductorSessionTitle(meta.Name)
+
+	// Check if session already exists
+	h.instancesMu.RLock()
+	var existing *session.Instance
+	for _, inst := range h.instances {
+		if inst.Title == sessionTitle {
+			existing = inst
+			break
+		}
+	}
+	h.instancesMu.RUnlock()
+
+	if existing != nil {
+		return h.restartSession(existing)
+	}
+
+	// Create new conductor session
+	dir, _ := session.ConductorNameDir(meta.Name)
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		sessionTitle, dir, "claude", "conductor",
+		"", "", "", false, false, nil,
+	)
 }
 
 // handleWorktreeFinishDialogKey processes key events for the worktree finish dialog

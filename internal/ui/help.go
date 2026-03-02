@@ -110,7 +110,7 @@ func (h *HelpOverlay) View() string {
 		{
 			title: "SESSIONS",
 			items: [][2]string{
-				{"n", "New session"},
+				{"n", "New session (conductor picker in conductor group)"},
 				{"N", "Quick create (auto name, smart defaults)"},
 				{"r", "Rename session"},
 				{"Shift+R", "Restart session"},
