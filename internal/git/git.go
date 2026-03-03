@@ -164,6 +164,45 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 		return fmt.Errorf("failed to create worktree: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 
+	if err := RunPostWorktreeHook(repoDir, worktreePath, branchName); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+	}
+
+	return nil
+}
+
+// RunPostWorktreeHook runs a project-specific post-worktree hook script if one exists.
+// Hook scripts are located at ~/.agent-deck/hooks/post-worktree/<project>.sh
+// where <project> is the basename of repoDir.
+// The script runs with cwd set to worktreePath and receives REPO_ROOT,
+// WORKTREE_PATH, and BRANCH as environment variables.
+func RunPostWorktreeHook(repoDir, worktreePath, branchName string) error {
+	projectName := filepath.Base(repoDir)
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	hookPath := filepath.Join(home, ".agent-deck", "hooks", "post-worktree", projectName+".sh")
+
+	if _, err := os.Stat(hookPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	cmd := exec.Command("bash", hookPath)
+	cmd.Dir = worktreePath
+	cmd.Env = append(os.Environ(),
+		"REPO_ROOT="+repoDir,
+		"WORKTREE_PATH="+worktreePath,
+		"BRANCH="+branchName,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
+	}
+
 	return nil
 }
 
