@@ -103,7 +103,7 @@ func (n *NotesDialog) View() string {
 	title := "Notes: " + n.groupName
 	titleStyle := DialogTitleStyle.Width(titleWidth)
 	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	hint := hintStyle.Render("Ctrl+S save │ Esc cancel")
+	hint := hintStyle.Render("Ctrl+S save │ Ctrl+A copy all │ Esc cancel")
 
 	dialogContent := lipgloss.JoinVertical(
 		lipgloss.Center,

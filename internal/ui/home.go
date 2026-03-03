@@ -4014,6 +4014,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				notes := session.LoadGroupNotes(h.profile, item.Path)
 				h.notesDialog.Show(item.Path, groupName, notes)
+				return h, tea.DisableMouse
 			} else if item.Type == session.ItemTypeGroup {
 				// Toggle group on enter
 				groupPath := item.Path
@@ -9511,10 +9512,17 @@ func (h *Home) handleNotesDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_ = session.SaveGroupNotes(h.profile, groupPath, content)
 		h.notesDialog.Hide()
 		h.rebuildFlatItems()
+		return h, tea.EnableMouseCellMotion
+	case "ctrl+a":
+		// Copy all notes content to system clipboard
+		content := h.notesDialog.Value()
+		cmd := exec.Command("pbcopy")
+		cmd.Stdin = strings.NewReader(content)
+		_ = cmd.Run()
 		return h, nil
 	case "esc":
 		h.notesDialog.Hide()
-		return h, nil
+		return h, tea.EnableMouseCellMotion
 	}
 
 	// Forward to textarea
