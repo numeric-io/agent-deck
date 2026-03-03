@@ -172,7 +172,7 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 }
 
 // RunPostWorktreeHook runs a project-specific post-worktree hook script if one exists.
-// Hook scripts are located at ~/.agent-deck/hooks/post-worktree/<project>.sh
+// Hook scripts are located at ~/.agent-deck/worktree-config/<project>/POST_HOOK.sh
 // where <project> is the basename of repoDir.
 // The script runs with cwd set to worktreePath and receives REPO_ROOT,
 // WORKTREE_PATH, and BRANCH as environment variables.
@@ -184,7 +184,7 @@ func RunPostWorktreeHook(repoDir, worktreePath, branchName string) error {
 		return fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	hookPath := filepath.Join(home, ".agent-deck", "hooks", "post-worktree", projectName+".sh")
+	hookPath := filepath.Join(home, ".agent-deck", "worktree-config", projectName, "POST_HOOK.sh")
 
 	if _, err := os.Stat(hookPath); os.IsNotExist(err) {
 		return nil

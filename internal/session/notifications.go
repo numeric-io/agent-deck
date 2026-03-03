@@ -244,9 +244,11 @@ func statusIcon(status Status) string {
 	}
 }
 
-// SyncFromInstances updates notifications based on current instance states
-// Call this periodically to sync with actual session statuses
-func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentSessionID string) (added, removed []string) {
+// SyncFromInstances updates notifications based on current instance states.
+// When groupFiltered is true, all non-current instances are shown (they've
+// already been narrowed to the relevant group by the caller).
+// Call this periodically to sync with actual session statuses.
+func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentSessionID string, groupFiltered bool) (added, removed []string) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
@@ -264,23 +266,17 @@ func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentS
 		return nil, nil
 	}
 
-	// Build set of sessions to show (based on showAll mode)
-	var sessionSet map[string]*Instance
-	if nm.showAll {
-		// Show all sessions (excluding current)
-		sessionSet = make(map[string]*Instance)
-		for _, inst := range instances {
-			if inst.ID != currentSessionID {
-				sessionSet[inst.ID] = inst
-			}
+	// Build set of sessions to show
+	// When groupFiltered, show all sessions (caller already filtered to same group).
+	// Otherwise respect the showAll config (backward compatible: only waiting).
+	showAll := nm.showAll || groupFiltered
+	sessionSet := make(map[string]*Instance)
+	for _, inst := range instances {
+		if inst.ID == currentSessionID {
+			continue
 		}
-	} else {
-		// Show only waiting sessions (backward compatible)
-		sessionSet = make(map[string]*Instance)
-		for _, inst := range instances {
-			if inst.GetStatusThreadSafe() == StatusWaiting && inst.ID != currentSessionID {
-				sessionSet[inst.ID] = inst
-			}
+		if showAll || inst.GetStatusThreadSafe() == StatusWaiting {
+			sessionSet[inst.ID] = inst
 		}
 	}
 

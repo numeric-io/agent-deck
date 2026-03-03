@@ -11,7 +11,7 @@ import (
 )
 
 // DefaultGroupName is the display name for the default group where ungrouped sessions go
-const DefaultGroupName = "My Sessions"
+const DefaultGroupName = "No Group"
 
 // DefaultGroupPath is the normalized path for the default group (used for lookups and protection)
 const DefaultGroupPath = "my-sessions"
