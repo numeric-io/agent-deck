@@ -4416,7 +4416,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			switch item.Type {
-			case session.ItemTypeGroup:
+			case session.ItemTypeGroup, session.ItemTypeNotes:
 				groupPath = item.Group.Path
 				groupName = item.Group.Name
 			case session.ItemTypeSession:
@@ -4425,12 +4425,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if group, exists := h.groupTree.Groups[groupPath]; exists {
 					groupName = group.Name
 				}
-				// Pre-fill path from highlighted session (prefer repo root over worktree)
+				// Pre-fill path from highlighted session
 				if item.Session != nil {
-					if item.Session.WorktreeRepoRoot != "" {
-						cursorSessionPath = item.Session.WorktreeRepoRoot
-					} else {
+					if item.Session.ProjectPath != "" {
 						cursorSessionPath = item.Session.ProjectPath
+					} else if item.Session.WorktreeRepoRoot != "" {
+						cursorSessionPath = item.Session.WorktreeRepoRoot
 					}
 				}
 			}
@@ -9530,7 +9530,7 @@ func (h *Home) handleNotesDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.notesDialog.Hide()
 		h.rebuildFlatItems()
 		return h, tea.EnableMouseCellMotion
-	case "ctrl+a":
+	case "ctrl+c":
 		// Copy all notes content to system clipboard
 		content := h.notesDialog.Value()
 		cmd := exec.Command("pbcopy")
