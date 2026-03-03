@@ -3758,7 +3758,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "enter":
+	case "ctrl+s":
 		// Validate before creating session
 		if validationErr := h.newDialog.Validate(); validationErr != "" {
 			h.newDialog.SetError(validationErr)
@@ -4404,9 +4404,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Apply user's preferred default tool from config
 		h.newDialog.SetDefaultTool(session.GetDefaultTool())
 
-		// Auto-select parent group from current cursor position
+		// Auto-select parent group and default path from current cursor position
 		groupPath := session.DefaultGroupPath
 		groupName := session.DefaultGroupName
+		var cursorSessionPath string
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			switch item.Type {
@@ -4419,9 +4420,20 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if group, exists := h.groupTree.Groups[groupPath]; exists {
 					groupName = group.Name
 				}
+				// Pre-fill path from highlighted session (prefer repo root over worktree)
+				if item.Session != nil {
+					if item.Session.WorktreeRepoRoot != "" {
+						cursorSessionPath = item.Session.WorktreeRepoRoot
+					} else {
+						cursorSessionPath = item.Session.ProjectPath
+					}
+				}
 			}
 		}
-		defaultPath := h.getDefaultPathForGroup(groupPath)
+		defaultPath := cursorSessionPath
+		if defaultPath == "" {
+			defaultPath = h.getDefaultPathForGroup(groupPath)
+		}
 		h.newDialog.ShowInGroup(groupPath, groupName, defaultPath)
 		return h, nil
 

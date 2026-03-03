@@ -15,6 +15,19 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
+// shortenHome replaces the user's home directory prefix with "~" for display.
+func shortenHome(path string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if path == home {
+			return "~"
+		}
+		if strings.HasPrefix(path, home+string(os.PathSeparator)) {
+			return "~" + path[len(home):]
+		}
+	}
+	return path
+}
+
 // focusTarget identifies a focusable element in the new session dialog.
 type focusTarget int
 
@@ -150,7 +163,7 @@ func NewNewDialog() *NewDialog {
 	// Get current working directory for default path
 	cwd, err := os.Getwd()
 	if err == nil {
-		pathInput.SetValue(cwd)
+		pathInput.SetValue(shortenHome(cwd))
 	}
 
 	// Create command input
@@ -219,11 +232,11 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.inheritedSettings = nil
 	// Set path input to group's default path if provided, otherwise use current working directory.
 	if defaultPath != "" {
-		d.pathInput.SetValue(defaultPath)
+		d.pathInput.SetValue(shortenHome(defaultPath))
 	} else {
 		cwd, err := os.Getwd()
 		if err == nil {
-			d.pathInput.SetValue(cwd)
+			d.pathInput.SetValue(shortenHome(cwd))
 		}
 	}
 	d.pathSoftSelected = true // activate soft-select for pre-filled path.
@@ -267,16 +280,37 @@ func (d *NewDialog) GetSelectedGroup() string {
 	return d.parentGroupPath
 }
 
-// SetSize sets the dialog dimensions
+// SetSize sets the dialog dimensions and resizes text inputs to fit.
 func (d *NewDialog) SetSize(width, height int) {
 	d.width = width
 	d.height = height
+
+	// Match the dialog width formula from View() and account for padding (4 each side) + border (1 each side).
+	dw := width / 2
+	if dw < 40 {
+		dw = 40
+	} else if dw > 100 {
+		dw = 100
+	}
+	inputWidth := dw - 10 // padding (8) + border (2)
+	if inputWidth < 20 {
+		inputWidth = 20
+	}
+	d.nameInput.Width = inputWidth
+	d.pathInput.Width = inputWidth
+	d.commandInput.Width = inputWidth
+	d.branchInput.Width = inputWidth
 }
 
-// SetPathSuggestions sets the available path suggestions for autocomplete
+// SetPathSuggestions sets the available path suggestions for autocomplete.
+// Paths are shortened to use ~ for the home directory prefix.
 func (d *NewDialog) SetPathSuggestions(paths []string) {
-	d.allPathSuggestions = paths
-	d.pathSuggestions = paths
+	shortened := make([]string, len(paths))
+	for i, p := range paths {
+		shortened[i] = shortenHome(p)
+	}
+	d.allPathSuggestions = shortened
+	d.pathSuggestions = shortened
 	d.pathSuggestionCursor = 0
 }
 
@@ -337,7 +371,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 // previewRecentSession pre-fills the dialog from a recent session row (keeps picker open).
 func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 	d.nameInput.SetValue(rs.Title)
-	d.pathInput.SetValue(rs.ProjectPath)
+	d.pathInput.SetValue(shortenHome(rs.ProjectPath))
 
 	// Default to shell/custom command mode.
 	d.commandCursor = 0
@@ -750,81 +784,54 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.pathSoftSelected = false
 				d.pathInput.Focus() // exit soft-select, allow editing
 			}
-			// Tab, Enter, Esc, Ctrl+N, Ctrl+P, Up, Down fall through to existing handlers
+			// Tab, S-Tab, Enter, Esc, Ctrl+N/P, Up, Down fall through to existing handlers
 		}
 
 		switch msg.String() {
 		case "tab":
-			// On path field: trigger autocomplete or cycle through matches.
+			// On command field: cycle forward through commands.
+			if cur == focusCommand {
+				d.commandCursor = (d.commandCursor + 1) % len(d.presetCommands)
+				d.updateToolOptions()
+				d.updateFocus()
+				return d, nil
+			}
+			// On path field: trigger directory autocomplete or cycle suggestions.
 			if cur == focusPath {
 				path := d.pathInput.Value()
-				info, err := os.Stat(path)
+				expanded := session.ExpandPath(path) // expand ~ for os.Stat / completions
+				info, err := os.Stat(expanded)
 				isDir := err == nil && info.IsDir()
 				isPartial := !isDir || strings.HasSuffix(path, string(os.PathSeparator))
 
 				if d.pathCycler.IsActive() || isPartial {
 					if d.pathCycler.IsActive() {
-						d.pathInput.SetValue(d.pathCycler.Next())
+						d.pathInput.SetValue(shortenHome(d.pathCycler.Next()))
 						d.pathInput.SetCursor(len(d.pathInput.Value()))
 						return d, nil
 					}
-					matches, err := session.GetDirectoryCompletions(path)
+					matches, err := session.GetDirectoryCompletions(expanded)
 					if err == nil && len(matches) > 0 {
+						for i, m := range matches {
+							matches[i] = shortenHome(m)
+						}
 						d.pathCycler.SetMatches(matches)
 						d.pathInput.SetValue(d.pathCycler.Next())
 						d.pathInput.SetCursor(len(d.pathInput.Value()))
 						return d, nil
 					}
 				}
-			}
-
-			// On path field: apply selected suggestion ONLY if user explicitly navigated.
-			if cur == focusPath && d.suggestionNavigated && len(d.pathSuggestions) > 0 {
-				if d.pathSuggestionCursor < len(d.pathSuggestions) {
-					d.pathInput.SetValue(d.pathSuggestions[d.pathSuggestionCursor])
-					d.pathInput.SetCursor(len(d.pathInput.Value()))
+				// Cycle forward through path suggestions.
+				if len(d.pathSuggestions) > 0 {
+					d.pathSoftSelected = false
+					d.pathInput.Focus()
+					d.pathSuggestionCursor = (d.pathSuggestionCursor + 1) % len(d.pathSuggestions)
+					d.suggestionNavigated = true
 				}
 			}
-			// Move to next field.
-			if d.focusIndex < maxIdx {
-				d.focusIndex++
-				d.updateFocus()
-			} else if cur == focusOptions && d.toolOptions != nil {
-				return d, d.toolOptions.Update(msg)
-			} else {
-				d.focusIndex = 0
-				d.updateFocus()
-			}
-			// Reset navigation flag when leaving path field.
-			if d.currentTarget() != focusPath {
-				d.suggestionNavigated = false
-			}
-			return d, cmd
+			return d, nil
 
-		case "ctrl+n":
-			// Next suggestion (when on path field).
-			if cur == focusPath && len(d.pathSuggestions) > 0 {
-				d.pathSoftSelected = false
-				d.pathInput.Focus() // exit soft-select, focus for future input.
-				d.pathSuggestionCursor = (d.pathSuggestionCursor + 1) % len(d.pathSuggestions)
-				d.suggestionNavigated = true
-				return d, nil
-			}
-
-		case "ctrl+p":
-			// Previous suggestion (when on path field).
-			if cur == focusPath && len(d.pathSuggestions) > 0 {
-				d.pathSoftSelected = false
-				d.pathInput.Focus() // exit soft-select, focus for future input.
-				d.pathSuggestionCursor--
-				if d.pathSuggestionCursor < 0 {
-					d.pathSuggestionCursor = len(d.pathSuggestions) - 1
-				}
-				d.suggestionNavigated = true
-				return d, nil
-			}
-
-		case "down":
+		case "down", "ctrl+n":
 			if d.focusIndex < maxIdx {
 				d.focusIndex++
 				d.updateFocus()
@@ -833,7 +840,30 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			}
 			return d, nil
 
-		case "shift+tab", "up":
+		case "shift+tab":
+			// On command field: cycle backward through commands.
+			if cur == focusCommand {
+				d.commandCursor--
+				if d.commandCursor < 0 {
+					d.commandCursor = len(d.presetCommands) - 1
+				}
+				d.updateToolOptions()
+				d.updateFocus()
+				return d, nil
+			}
+			// On path field: cycle backward through path suggestions.
+			if cur == focusPath && len(d.pathSuggestions) > 0 {
+				d.pathSoftSelected = false
+				d.pathInput.Focus()
+				d.pathSuggestionCursor--
+				if d.pathSuggestionCursor < 0 {
+					d.pathSuggestionCursor = len(d.pathSuggestions) - 1
+				}
+				d.suggestionNavigated = true
+			}
+			return d, nil
+
+		case "up", "ctrl+p":
 			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtTop() {
 				return d, d.toolOptions.Update(msg)
 			}
@@ -849,6 +879,15 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "enter":
+			// On path field with navigated suggestion: apply it and stay.
+			if cur == focusPath && d.suggestionNavigated && len(d.pathSuggestions) > 0 {
+				if d.pathSuggestionCursor < len(d.pathSuggestions) {
+					d.pathInput.SetValue(d.pathSuggestions[d.pathSuggestionCursor])
+					d.pathInput.SetCursor(len(d.pathInput.Value()))
+					d.pathSoftSelected = true
+					d.suggestionNavigated = false
+				}
+			}
 			return d, nil
 
 		case "left":
@@ -995,13 +1034,12 @@ func (d *NewDialog) View() string {
 	labelStyle := lipgloss.NewStyle().
 		Foreground(ColorText)
 
-	// Responsive dialog width
-	dialogWidth := 60
-	if d.width > 0 && d.width < dialogWidth+10 {
-		dialogWidth = d.width - 10
-		if dialogWidth < 40 {
-			dialogWidth = 40
-		}
+	// Responsive dialog width — 50% of screen, clamped to [40, 100]
+	dialogWidth := d.width / 2
+	if dialogWidth < 40 {
+		dialogWidth = 40
+	} else if dialogWidth > 100 {
+		dialogWidth = 100
 	}
 
 	dialogStyle := lipgloss.NewStyle().
@@ -1323,26 +1361,26 @@ func (d *NewDialog) View() string {
 	if len(d.recentSessions) > 0 {
 		recentPrefix = "^R recent │ "
 	}
-	helpText := recentPrefix + "Tab next/accept │ ↑↓ navigate │ Enter create │ Esc cancel"
+	helpText := recentPrefix + "^N/^P navigate │ ^S create │ Esc cancel"
 	if cur == focusPath {
 		if d.pathSoftSelected {
-			helpText = "Type to replace │ ←→ to edit │ ^N/^P recent │ Tab next │ Esc cancel"
+			helpText = "Type to replace │ ←→ to edit │ Tab/S-Tab recent │ ^N/^P navigate │ Esc cancel"
 		} else {
-			helpText = "Tab autocomplete │ ^N/^P recent │ ↑↓ navigate │ Enter create │ Esc cancel"
+			helpText = "Tab autocomplete/recent │ S-Tab recent │ ^N/^P navigate │ ^S create │ Esc cancel"
 		}
 	} else if cur == focusCommand {
 		selectedCmd := d.GetSelectedCommand()
 		if selectedCmd == "gemini" || selectedCmd == "codex" {
-			helpText = "←→ command │ w worktree │ s sandbox │ y yolo │ Tab next │ Enter create │ Esc cancel"
+			helpText = "Tab/S-Tab command │ w worktree │ s sandbox │ y yolo │ ^N/^P navigate │ ^S create │ Esc cancel"
 		} else {
-			helpText = "←→ command │ w worktree │ s sandbox │ Tab next │ Enter create │ Esc cancel"
+			helpText = "Tab/S-Tab command │ w worktree │ s sandbox │ ^N/^P navigate │ ^S create │ Esc cancel"
 		}
 	} else if cur == focusWorktree || cur == focusSandbox {
-		helpText = "Space toggle │ ↑↓ navigate │ Enter create │ Esc cancel"
+		helpText = "Space toggle │ ^N/^P navigate │ ^S create │ Esc cancel"
 	} else if cur == focusInherited {
-		helpText = "Space expand/collapse │ ↑↓ navigate │ Enter create │ Esc cancel"
+		helpText = "Space expand/collapse │ ^N/^P navigate │ ^S create │ Esc cancel"
 	} else if cur == focusOptions && d.toolOptions != nil {
-		helpText = "Space/y toggle │ ↑↓ navigate │ Enter create │ Esc cancel"
+		helpText = "Space/y toggle │ ^N/^P navigate │ ^S create │ Esc cancel"
 	}
 	content.WriteString(helpStyle.Render(helpText))
 

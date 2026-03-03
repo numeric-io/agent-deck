@@ -265,11 +265,11 @@ func (g *GroupDialog) SetSize(width, height int) {
 func (g *GroupDialog) Update(msg tea.KeyMsg) (*GroupDialog, tea.Cmd) {
 	if g.mode == GroupDialogMove {
 		switch msg.String() {
-		case "up", "k":
+		case "up", "k", "ctrl+p":
 			if g.selected > 0 {
 				g.selected--
 			}
-		case "down", "j":
+		case "down", "j", "ctrl+n":
 			if g.selected < len(g.groupPaths)-1 {
 				g.selected++
 			}
