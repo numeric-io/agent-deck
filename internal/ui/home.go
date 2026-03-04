@@ -7521,10 +7521,20 @@ func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected b
 
 // renderNotesItem renders the notes entry under a group header
 func (h *Home) renderNotesItem(b *strings.Builder, item session.Item, selected bool) {
-	// Indentation matching session items within the same group
-	indent := strings.Repeat(strings.Repeat(" ", spacingNormal), max(0, item.Level))
+	// Match session item indentation: baseIndent + selectionPrefix + treeConnector
+	// Sessions at level 1 use "" + " " + "├─", so we replicate that pattern.
+	baseIndent := ""
+	if item.Level > 1 {
+		baseIndent = strings.Repeat(treeEmpty, item.Level-1)
+	}
 
-	connector := TreeConnectorStyle.Render(treeBranch)
+	treeStyle := TreeConnectorStyle
+	selectionPrefix := " "
+	if selected {
+		selectionPrefix = SessionSelectionPrefix.Render("▶")
+		treeStyle = TreeConnectorSelStyle
+	}
+	connector := treeStyle.Render(treeBranch)
 
 	// Icon + preview text
 	preview := item.Notes
@@ -7540,7 +7550,7 @@ func (h *Home) renderNotesItem(b *strings.Builder, item session.Item, selected b
 		text = DimStyle.Render("\U0001F4DD " + preview)
 	}
 
-	b.WriteString(fmt.Sprintf("%s%s %s\n", indent, connector, text))
+	b.WriteString(fmt.Sprintf("%s%s%s %s\n", baseIndent, selectionPrefix, connector, text))
 }
 
 // Tree drawing characters for visual hierarchy
