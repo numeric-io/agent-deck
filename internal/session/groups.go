@@ -216,7 +216,7 @@ func (t *GroupTree) rebuildGroupList() {
 			if t.GroupList[i].Order != t.GroupList[j].Order {
 				return t.GroupList[i].Order < t.GroupList[j].Order
 			}
-			return t.GroupList[i].Name < t.GroupList[j].Name
+			return strings.ToLower(t.GroupList[i].Name) < strings.ToLower(t.GroupList[j].Name)
 		}
 
 		// Different parents - compare at root level to keep tree structure
@@ -251,7 +251,7 @@ func (t *GroupTree) rebuildGroupList() {
 				if branchI.Order != branchJ.Order {
 					return branchI.Order < branchJ.Order
 				}
-				return branchI.Name < branchJ.Name
+				return strings.ToLower(branchI.Name) < strings.ToLower(branchJ.Name)
 			}
 
 			// Fallback to path comparison if branches not found
@@ -266,7 +266,7 @@ func (t *GroupTree) rebuildGroupList() {
 			if rootGroupI.Order != rootGroupJ.Order {
 				return rootGroupI.Order < rootGroupJ.Order
 			}
-			return rootGroupI.Name < rootGroupJ.Name
+			return strings.ToLower(rootGroupI.Name) < strings.ToLower(rootGroupJ.Name)
 		}
 
 		// Fallback to full path comparison if root groups not found
