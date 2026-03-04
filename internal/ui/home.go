@@ -4107,7 +4107,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if h.cursor > 0 {
 				h.cursor--
 			}
-			h.saveInstances()
+			h.forceSaveInstances()
 		}
 		return h, nil
 
@@ -4125,7 +4125,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if h.cursor < len(h.flatItems)-1 {
 				h.cursor++
 			}
-			h.saveInstances()
+			h.forceSaveInstances()
 		}
 		return h, nil
 
@@ -4476,7 +4476,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					// Clear idle optimization so UpdateStatus does a full check
 					item.Session.ForceNextStatusCheck()
 					_ = item.Session.UpdateStatus()
-					h.saveInstances()
+					h.forceSaveInstances()
 				}
 			}
 		}
@@ -4507,7 +4507,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// Toggle: set per-session override to opposite of current
 				newYolo := !currentYolo
 				inst.GeminiYoloMode = &newYolo
-				h.saveInstances()
+				h.forceSaveInstances()
 				// If session is running, it needs restart to apply
 				if inst.GetStatusThreadSafe() == session.StatusRunning ||
 					inst.GetStatusThreadSafe() == session.StatusWaiting {
@@ -4758,7 +4758,7 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.instances = h.groupTree.GetAllInstances()
 				h.instancesMu.Unlock()
 				h.rebuildFlatItems()
-				h.saveInstances()
+				h.forceSaveInstances()
 			}
 			h.confirmDialog.Hide()
 			return h, nil
@@ -4981,7 +4981,7 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.groupTree.CreateGroup(name)
 				}
 				h.rebuildFlatItems()
-				h.saveInstances() // Persist the new group
+				h.forceSaveInstances() // Persist the new group
 			}
 		case GroupDialogRename:
 			name := h.groupDialog.GetValue()
@@ -5004,7 +5004,7 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.instances = h.groupTree.GetAllInstances()
 				h.instancesMu.Unlock()
 				h.rebuildFlatItems()
-				h.saveInstances()
+				h.forceSaveInstances()
 			}
 		case GroupDialogMove:
 			targetGroupPath := h.groupDialog.GetSelectedGroup()
@@ -5016,7 +5016,7 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.instances = h.groupTree.GetAllInstances()
 					h.instancesMu.Unlock()
 					h.rebuildFlatItems()
-					h.saveInstances()
+					h.forceSaveInstances()
 				}
 			}
 		case GroupDialogRenameSession:
@@ -5071,7 +5071,7 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					// Invalidate preview cache since title changed
 					h.invalidatePreviewCache(sessionID)
 					h.rebuildFlatItems()
-					h.saveInstances()
+					h.forceSaveInstances()
 				}
 			}
 		}
