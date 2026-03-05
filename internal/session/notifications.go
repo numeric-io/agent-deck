@@ -13,6 +13,8 @@ type NotificationEntry struct {
 	SessionID    string
 	TmuxName     string
 	Title        string
+	Tool         string // e.g. "claude", "shell"
+	GroupName    string // Display name of the session's group
 	AssignedKey  string
 	WaitingSince time.Time
 	Status       Status // For icon rendering when show_all enabled
@@ -69,6 +71,8 @@ func (nm *NotificationManager) Add(inst *Instance) error {
 		SessionID:    inst.ID,
 		TmuxName:     tmuxName,
 		Title:        inst.Title,
+		Tool:         inst.GetToolThreadSafe(),
+		GroupName:    extractGroupName(inst.GroupPath),
 		WaitingSince: time.Now(),
 	}
 
@@ -175,18 +179,30 @@ func (nm *NotificationManager) FormatBar() string {
 	var parts []string
 	for _, e := range nm.entries {
 		var formatted string
+		// Key badge lights up when tmux prefix (Ctrl+B) is active
+		// Normal: dim key badge; Prefix active: bright bold key badge
+		keyBadge := fmt.Sprintf(
+			"#{?client_prefix,#[fg=#c0caf5]#[bold][%s]#[nobold]#[default],#[fg=#787fa0][%s]#[default]}",
+			e.AssignedKey, e.AssignedKey,
+		)
+		// Show group/title tool, like a filesystem path
+		displayName := e.Title
+		if e.GroupName != "" && e.GroupName != DefaultGroupPath {
+			displayName = e.GroupName + "/" + e.Title
+		}
+		if e.Tool != "" && e.Tool != "shell" {
+			displayName += " " + e.Tool
+		}
 		if nm.showAll {
-			// Show status icon when in show_all mode
 			icon := statusIcon(e.Status)
-			formatted = fmt.Sprintf("[%s] %s %s", e.AssignedKey, icon, e.Title)
+			formatted = fmt.Sprintf("%s %s %s", keyBadge, icon, displayName)
 		} else {
-			// Original format without icons (backward compatible)
-			formatted = fmt.Sprintf("[%s] %s", e.AssignedKey, e.Title)
+			formatted = fmt.Sprintf("%s %s", keyBadge, displayName)
 		}
 		parts = append(parts, formatted)
 	}
 
-	return "⚡ " + strings.Join(parts, " ")
+	return "ctrl+b jump: " + strings.Join(parts, " ")
 }
 
 // statusColor returns the tmux fg color escape for a given status, matching the TUI palette.
@@ -284,8 +300,14 @@ func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentS
 	newEntries := make([]*NotificationEntry, 0)
 	for _, e := range nm.entries {
 		if inst, stillPresent := sessionSet[e.SessionID]; stillPresent {
-			// Update status for existing entries
+			// Update fields for existing entries
 			e.Status = inst.GetStatusThreadSafe()
+			e.Title = inst.Title
+			e.Tool = inst.GetToolThreadSafe()
+			e.GroupName = extractGroupName(inst.GroupPath)
+			if ts := inst.GetTmuxSession(); ts != nil {
+				e.TmuxName = ts.Name
+			}
 			newEntries = append(newEntries, e)
 			delete(sessionSet, e.SessionID) // Don't re-add
 		} else {
@@ -304,6 +326,8 @@ func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentS
 			SessionID:    inst.ID,
 			TmuxName:     tmuxName,
 			Title:        inst.Title,
+			Tool:         inst.GetToolThreadSafe(),
+			GroupName:    extractGroupName(inst.GroupPath),
 			WaitingSince: inst.GetWaitingSince(),
 			Status:       inst.GetStatusThreadSafe(),
 		}

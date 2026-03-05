@@ -3524,18 +3524,61 @@ func captureOriginalStatusLeft() {
 // This is a MAJOR performance optimization: ONE tmux call instead of 100+.
 // All agentdeck sessions inherit this global setting.
 // On first call, captures the existing status-left so ClearStatusLeftGlobal can restore it.
+// Also hides the tmux window list so it doesn't run into the notification bar text.
 func SetStatusLeftGlobal(text string) error {
 	savedStatusLeft.Do(captureOriginalStatusLeft)
+	captureOriginalWindowStatus()
 	escaped := strings.ReplaceAll(text, "'", "'\\''")
-	cmd := exec.Command("tmux", "set-option", "-g", "status-left", escaped)
+	// Hide window list so it doesn't bleed into our bar text
+	cmd := exec.Command("tmux",
+		"set-option", "-g", "status-left", escaped, ";",
+		"set-option", "-g", "window-status-format", "", ";",
+		"set-option", "-g", "window-status-current-format", "",
+	)
 	return cmd.Run()
 }
 
-// ClearStatusLeftGlobal restores the original global status-left value.
+// savedWindowStatus holds the original global window-status-format and
+// window-status-current-format values before agent-deck blanks them.
+var savedWindowStatus struct {
+	sync.Once
+	windowFmt        string
+	windowCurrentFmt string
+	captured         bool
+}
+
+// captureOriginalWindowStatus reads and stores the current window status formats.
+func captureOriginalWindowStatus() {
+	savedWindowStatus.Do(func() {
+		if out, err := exec.Command("tmux", "show-option", "-gv", "window-status-format").Output(); err == nil {
+			savedWindowStatus.windowFmt = strings.TrimRight(string(out), "\n")
+		}
+		if out, err := exec.Command("tmux", "show-option", "-gv", "window-status-current-format").Output(); err == nil {
+			savedWindowStatus.windowCurrentFmt = strings.TrimRight(string(out), "\n")
+		}
+		savedWindowStatus.captured = true
+	})
+}
+
+// ClearStatusLeftGlobal restores the original global status-left value and window list formats.
 // If the original value was captured, it is restored so the user's theme/plugin
 // (e.g., tmux-oasis) is preserved. Falls back to unsetting the option only if
 // no original value was captured.
 func ClearStatusLeftGlobal() error {
+	// Restore window status formats
+	if savedWindowStatus.captured {
+		esc1 := strings.ReplaceAll(savedWindowStatus.windowFmt, "'", "'\\''")
+		esc2 := strings.ReplaceAll(savedWindowStatus.windowCurrentFmt, "'", "'\\''")
+		_ = exec.Command("tmux",
+			"set-option", "-g", "window-status-format", esc1, ";",
+			"set-option", "-g", "window-status-current-format", esc2,
+		).Run()
+	} else {
+		_ = exec.Command("tmux", "set-option", "-gu", "window-status-format").Run()
+		_ = exec.Command("tmux", "set-option", "-gu", "window-status-current-format").Run()
+	}
+
+	// Restore status-left
 	if savedStatusLeft.captured {
 		escaped := strings.ReplaceAll(savedStatusLeft.value, "'", "'\\''")
 		return exec.Command("tmux", "set-option", "-g", "status-left", escaped).Run()

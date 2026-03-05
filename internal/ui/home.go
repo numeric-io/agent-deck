@@ -5817,6 +5817,10 @@ skipSave:
 		statusLog.Debug("acknowledged_on_attach", slog.String("title", inst.Title))
 	}
 
+	// Immediately sync notification bar so it shows same-group sessions
+	// before the 2s background tick. This avoids the flash of all-sessions.
+	h.syncNotificationsBackground()
+
 	// Use tea.Exec with a custom command that runs our Attach method
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
