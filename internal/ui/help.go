@@ -158,6 +158,7 @@ func (h *HelpOverlay) View() string {
 			title: "OTHER",
 			items: [][2]string{
 				{"S", "Settings"},
+				{"b", "Bridge status (conductor daemon)"},
 				{"Ctrl+R", "Reload from disk"},
 				{"i", "Import tmux sessions"},
 				{"Ctrl+Q", "Detach from session"},

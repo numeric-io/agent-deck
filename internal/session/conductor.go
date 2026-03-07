@@ -1077,6 +1077,85 @@ func GetConductorSettings() ConductorSettings {
 	return config.Conductor
 }
 
+// BridgeStatus holds the current state of the conductor bridge daemon and its configuration.
+type BridgeStatus struct {
+	Running    bool
+	Conductors []ConductorMeta
+	Slack      SlackSettings
+	Telegram   TelegramSettings
+	Discord    DiscordSettings
+}
+
+// HasSlack returns true if Slack is configured (has bot token and app token).
+func (b *BridgeStatus) HasSlack() bool {
+	return b.Slack.BotToken != "" && b.Slack.AppToken != ""
+}
+
+// HasTelegram returns true if Telegram is configured.
+func (b *BridgeStatus) HasTelegram() bool {
+	return b.Telegram.Token != "" && b.Telegram.UserID != 0
+}
+
+// HasDiscord returns true if Discord is configured.
+func (b *BridgeStatus) HasDiscord() bool {
+	return b.Discord.BotToken != "" && b.Discord.ChannelID != 0
+}
+
+// GetBridgeStatus returns the current bridge daemon status and configuration.
+func GetBridgeStatus() BridgeStatus {
+	status := BridgeStatus{
+		Running: IsBridgeDaemonRunning(),
+	}
+	settings := GetConductorSettings()
+	status.Slack = settings.Slack
+	status.Telegram = settings.Telegram
+	status.Discord = settings.Discord
+	conductors, err := ListConductors()
+	if err == nil {
+		status.Conductors = conductors
+	}
+	return status
+}
+
+// BridgeLogPath returns the path to the bridge daemon log file.
+func BridgeLogPath() (string, error) {
+	condDir, err := ConductorDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(condDir, "bridge.log"), nil
+}
+
+// RestartBridgeDaemon stops and restarts the bridge daemon.
+func RestartBridgeDaemon() error {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		plistPath, err := LaunchdPlistPath()
+		if err != nil {
+			return fmt.Errorf("failed to get plist path: %w", err)
+		}
+		if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+			return fmt.Errorf("bridge plist not installed; run 'agent-deck conductor setup <name>' first")
+		}
+		_ = exec.Command("launchctl", "unload", plistPath).Run()
+		if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
+			return fmt.Errorf("failed to load bridge daemon: %w", err)
+		}
+		return nil
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		if !systemdUserAvailable() {
+			return fmt.Errorf("systemd user session not available; start manually")
+		}
+		if err := exec.Command("systemctl", "--user", "restart", systemdBridgeServiceName).Run(); err != nil {
+			return fmt.Errorf("failed to restart bridge daemon: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported platform for daemon management")
+	}
+}
+
 // LaunchdPlistName is the launchd label for the conductor bridge daemon
 const LaunchdPlistName = "com.agentdeck.conductor-bridge"
 

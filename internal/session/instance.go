@@ -150,6 +150,10 @@ type Instance struct {
 	// Not serialized - only relevant for current TUI session
 	lastStartTime time.Time
 
+	// liveWorkDir caches the pane's current working directory from tmux.
+	// Updated during UpdateStatus; not serialized.
+	liveWorkDir string
+
 	// SkipMCPRegenerate skips .mcp.json regeneration on next Restart()
 	// Set by MCP dialog Apply() to avoid race condition where Apply writes
 	// config then Restart immediately overwrites it with different pool state
@@ -1970,6 +1974,11 @@ func (i *Instance) UpdateStatus() error {
 	// Session exists - clear error check timestamp
 	i.lastErrorCheck = time.Time{}
 
+	// Update live working directory from tmux pane
+	if wd := i.tmuxSession.GetWorkDir(); wd != "" {
+		i.liveWorkDir = wd
+	}
+
 	// Tiered polling: skip expensive checks for idle sessions with no new activity
 	if i.Status == StatusIdle {
 		currentTS := i.tmuxSession.GetCachedWindowActivity()
@@ -3766,12 +3775,14 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 	return cmd, nil
 }
 
-// GetActualWorkDir returns the actual working directory from tmux, or falls back to ProjectPath
-func (i *Instance) GetActualWorkDir() string {
-	if i.tmuxSession != nil {
-		if workDir := i.tmuxSession.GetWorkDir(); workDir != "" {
-			return workDir
-		}
+// GetDisplayPath returns the live working directory if available, falling back to ProjectPath.
+// The live value is updated during UpdateStatus from tmux's pane_current_path.
+func (i *Instance) GetDisplayPath() string {
+	i.mu.RLock()
+	wd := i.liveWorkDir
+	i.mu.RUnlock()
+	if wd != "" {
+		return wd
 	}
 	return i.ProjectPath
 }
