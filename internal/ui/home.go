@@ -173,6 +173,7 @@ type Home struct {
 	conductorPickerDialog *ConductorPickerDialog // For starting a conductor from TUI
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
 	notesDialog          *NotesDialog          // For editing group notes
+	bridgeStatusDialog   *BridgeStatusDialog   // For viewing bridge daemon status
 
 	// Analytics cache (async fetching with TTL)
 	currentAnalytics       *session.SessionAnalytics                  // Current analytics for selected session (Claude)
@@ -302,6 +303,11 @@ type Home struct {
 		valid                           atomic.Bool // THREAD-SAFE: accessed from main and worker goroutines
 		timestamp                       time.Time   // For time-based expiration
 	}
+
+	// Cached bridge daemon status (checked at most every 30s to avoid shelling out on every render)
+	cachedBridgeRunning     bool
+	cachedBridgeRunningTime time.Time
+	cachedBridgeEnabled     bool
 
 	// Reusable string builder for View() to reduce allocations
 	viewBuilder strings.Builder
@@ -569,6 +575,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		conductorPickerDialog: NewConductorPickerDialog(),
 		worktreeFinishDialog: NewWorktreeFinishDialog(),
 		notesDialog:          NewNotesDialog(),
+		bridgeStatusDialog:   NewBridgeStatusDialog(),
 		cursor:               0,
 		initialLoading:       true, // Show splash until sessions load
 		ctx:                  ctx,
@@ -2929,6 +2936,29 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.updateInfo = msg.info
 		return h, nil
 
+	case bridgeRestartedMsg:
+		if h.bridgeStatusDialog.IsVisible() {
+			if msg.err != nil {
+				h.bridgeStatusDialog.SetMessage("Restart failed: " + msg.err.Error())
+			} else {
+				h.bridgeStatusDialog.SetMessage("Bridge daemon restarted")
+				// Refresh status after restart
+				status := session.GetBridgeStatus()
+				runningNames := make(map[string]bool)
+				h.instancesMu.RLock()
+				for _, inst := range h.instances {
+					if inst.GroupPath == "conductor" && inst.Exists() {
+						runningNames[inst.Title] = true
+					}
+				}
+				h.instancesMu.RUnlock()
+				h.bridgeStatusDialog.Refresh(status, runningNames)
+				// Invalidate header cache so it picks up new status
+				h.cachedBridgeRunningTime = time.Time{}
+			}
+		}
+		return h, nil
+
 	case remoteSessionsFetchedMsg:
 		h.remoteSessionsMu.Lock()
 		h.remoteSessions = msg.sessions
@@ -3608,6 +3638,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.notesDialog.IsVisible() {
 			return h.handleNotesDialogKey(msg)
 		}
+		if h.bridgeStatusDialog.IsVisible() {
+			return h.handleBridgeStatusDialogKey(msg)
+		}
 
 		// Main view keys
 		return h.handleMainKey(msg)
@@ -4229,11 +4262,16 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "M", "shift+m":
-		// Move session to different group
+		// Move session or group
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession {
-				h.groupDialog.ShowMove(h.groupTree.GetGroupPaths())
+				h.groupDialog.ShowMove(h.groupTree.GetGroupPaths(), h.groupTree.GetGroupNames())
+			} else if item.Type == session.ItemTypeGroup && item.Path != session.DefaultGroupPath {
+				paths, names := h.groupTree.GetValidMoveTargetsForGroup(item.Path)
+				if len(paths) > 0 {
+					h.groupDialog.ShowMoveGroup(item.Path, paths, names)
+				}
 			}
 		}
 		return h, nil
@@ -4343,6 +4381,21 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Open settings panel
 		h.settingsPanel.Show()
 		h.settingsPanel.SetSize(h.width, h.height)
+		return h, nil
+
+	case "b":
+		// Open bridge status dialog
+		status := session.GetBridgeStatus()
+		runningNames := make(map[string]bool)
+		h.instancesMu.RLock()
+		for _, inst := range h.instances {
+			if inst.GroupPath == "conductor" && inst.Exists() {
+				runningNames[inst.Title] = true
+			}
+		}
+		h.instancesMu.RUnlock()
+		h.bridgeStatusDialog.SetSize(h.width, h.height)
+		h.bridgeStatusDialog.Show(status, runningNames)
 		return h, nil
 
 	case "E":
@@ -5042,6 +5095,17 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.rebuildFlatItems()
 					h.forceSaveInstances()
 				}
+			}
+		case GroupDialogMoveGroup:
+			targetGroupPath := h.groupDialog.GetSelectedGroup()
+			groupPath := h.groupDialog.GetGroupPath()
+			if groupPath != "" {
+				h.groupTree.ReparentGroup(groupPath, targetGroupPath)
+				h.instancesMu.Lock()
+				h.instances = h.groupTree.GetAllInstances()
+				h.instancesMu.Unlock()
+				h.rebuildFlatItems()
+				h.forceSaveInstances()
 			}
 		case GroupDialogRenameSession:
 			newName := h.groupDialog.GetValue()
@@ -6177,6 +6241,7 @@ func (h *Home) updateSizes() {
 	h.geminiModelDialog.SetSize(h.width, h.height)
 	h.worktreeFinishDialog.SetSize(h.width, h.height)
 	h.notesDialog.SetSize(h.width, h.height)
+	h.bridgeStatusDialog.SetSize(h.width, h.height)
 }
 
 // View renders the UI
@@ -6269,6 +6334,9 @@ func (h *Home) View() string {
 	if h.notesDialog.IsVisible() {
 		return h.notesDialog.View()
 	}
+	if h.bridgeStatusDialog.IsVisible() {
+		return h.bridgeStatusDialog.View()
+	}
 
 	// Reuse viewBuilder to reduce allocations (reset and pre-allocate)
 	h.viewBuilder.Reset()
@@ -6340,8 +6408,27 @@ func (h *Home) View() string {
 		Faint(true)
 	versionBadge := versionStyle.Render("v" + Version)
 
+	// Bridge status indicator (only shown if conductor is configured)
+	// Uses cached values refreshed every 30s to avoid shelling out on every render
+	bridgeIndicator := ""
+	if time.Since(h.cachedBridgeRunningTime) > 30*time.Second {
+		settings := session.GetConductorSettings()
+		h.cachedBridgeEnabled = settings.Enabled
+		if settings.Enabled {
+			h.cachedBridgeRunning = session.IsBridgeDaemonRunning()
+		}
+		h.cachedBridgeRunningTime = time.Now()
+	}
+	if h.cachedBridgeEnabled {
+		if h.cachedBridgeRunning {
+			bridgeIndicator = statsSep + lipgloss.NewStyle().Foreground(ColorGreen).Render("⚡bridge")
+		} else {
+			bridgeIndicator = statsSep + lipgloss.NewStyle().Foreground(ColorRed).Render("⚡bridge")
+		}
+	}
+
 	// Fill remaining header space
-	headerLeft := lipgloss.JoinHorizontal(lipgloss.Left, logo, "  ", title, "  ", stats)
+	headerLeft := lipgloss.JoinHorizontal(lipgloss.Left, logo, "  ", title, "  ", stats, bridgeIndicator)
 	headerPadding := h.width - lipgloss.Width(headerLeft) - lipgloss.Width(versionBadge) - 2
 	if headerPadding < 1 {
 		headerPadding = 1
@@ -8249,7 +8336,7 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 	valueStyle := lipgloss.NewStyle().Foreground(ColorText)
 
 	// Path
-	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Path:"), valueStyle.Render(inst.ProjectPath)))
+	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Path:"), valueStyle.Render(inst.GetDisplayPath())))
 
 	// Status with color
 	var statusColor lipgloss.Color
@@ -8362,7 +8449,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 	// Info lines: path and activity time
 	infoStyle := lipgloss.NewStyle().Foreground(ColorText)
-	pathStr := truncatePath(selected.ProjectPath, width-4)
+	pathStr := truncatePath(selected.GetDisplayPath(), width-4)
 	b.WriteString(infoStyle.Render("📁 " + pathStr))
 	b.WriteString("\n")
 
@@ -9566,6 +9653,35 @@ func (h *Home) handleConductorPickerDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cm
 		h.conductorPickerDialog.Update(msg)
 		return h, nil
 	}
+}
+
+// handleBridgeStatusDialogKey handles key events when the bridge status dialog is visible.
+func (h *Home) handleBridgeStatusDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", "b":
+		h.bridgeStatusDialog.Hide()
+		return h, nil
+	case "R":
+		// Restart bridge daemon
+		h.bridgeStatusDialog.SetMessage("Restarting bridge daemon...")
+		return h, func() tea.Msg {
+			err := session.RestartBridgeDaemon()
+			if err != nil {
+				return bridgeRestartedMsg{err: err}
+			}
+			return bridgeRestartedMsg{}
+		}
+	case "L":
+		h.bridgeStatusDialog.ToggleLogs()
+		return h, nil
+	default:
+		return h, nil
+	}
+}
+
+// bridgeRestartedMsg is sent after a bridge restart attempt completes.
+type bridgeRestartedMsg struct {
+	err error
 }
 
 // startConductorSession starts or restarts a conductor session from its metadata.

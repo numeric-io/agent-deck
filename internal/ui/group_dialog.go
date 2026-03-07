@@ -16,6 +16,7 @@ const (
 	GroupDialogCreate GroupDialogMode = iota
 	GroupDialogRename
 	GroupDialogMove
+	GroupDialogMoveGroup
 	GroupDialogRenameSession
 )
 
@@ -29,6 +30,7 @@ type GroupDialog struct {
 	groupPath     string   // Current group being edited (for rename) or parent path (for create subgroup)
 	parentName    string   // Display name of parent group (for subgroup creation)
 	groupPaths    []string // Available target group paths (for move)
+	groupNames    []string // Display names corresponding to groupPaths (for move)
 	selected      int      // Selected group index (for move)
 	sessionID     string   // Session ID being renamed (for rename session)
 	validationErr string   // Inline validation error displayed inside the dialog
@@ -147,11 +149,23 @@ func (g *GroupDialog) ShowRename(currentPath, currentName string) {
 }
 
 // ShowMove shows the dialog for moving a session to a group path.
-func (g *GroupDialog) ShowMove(groupPaths []string) {
+func (g *GroupDialog) ShowMove(groupPaths, groupNames []string) {
 	g.visible = true
 	g.mode = GroupDialogMove
 	g.validationErr = ""
 	g.groupPaths = groupPaths
+	g.groupNames = groupNames
+	g.selected = 0
+}
+
+// ShowMoveGroup shows the dialog for moving a group into another group.
+func (g *GroupDialog) ShowMoveGroup(groupPath string, targetPaths, targetNames []string) {
+	g.visible = true
+	g.mode = GroupDialogMoveGroup
+	g.validationErr = ""
+	g.groupPath = groupPath
+	g.groupPaths = targetPaths
+	g.groupNames = targetNames
 	g.selected = 0
 }
 
@@ -193,8 +207,8 @@ func (g *GroupDialog) GetValue() string {
 
 // Validate checks if the dialog values are valid and returns an error message if not
 func (g *GroupDialog) Validate() string {
-	if g.mode == GroupDialogMove {
-		return "" // Move mode doesn't need validation
+	if g.mode == GroupDialogMove || g.mode == GroupDialogMoveGroup {
+		return "" // Move modes don't need validation
 	}
 
 	name := strings.TrimSpace(g.nameInput.Value())
@@ -263,7 +277,7 @@ func (g *GroupDialog) SetSize(width, height int) {
 
 // Update handles input
 func (g *GroupDialog) Update(msg tea.KeyMsg) (*GroupDialog, tea.Cmd) {
-	if g.mode == GroupDialogMove {
+	if g.mode == GroupDialogMove || g.mode == GroupDialogMoveGroup {
 		switch msg.String() {
 		case "up", "k", "ctrl+p":
 			if g.selected > 0 {
@@ -333,19 +347,46 @@ func (g *GroupDialog) View() string {
 	case GroupDialogMove:
 		title = "Move to Group"
 		var items []string
-		for i, groupPath := range g.groupPaths {
+		for i := range g.groupPaths {
+			displayName := g.groupPaths[i]
+			if i < len(g.groupNames) && g.groupNames[i] != "" {
+				displayName = g.groupNames[i]
+			}
 			if i == g.selected {
 				items = append(items, lipgloss.NewStyle().
 					Foreground(ColorBg).
 					Background(ColorAccent).
 					Bold(true).
 					Padding(0, 1).
-					Render(groupPath))
+					Render(displayName))
 			} else {
 				items = append(items, lipgloss.NewStyle().
 					Foreground(ColorText).
 					Padding(0, 1).
-					Render(groupPath))
+					Render(displayName))
+			}
+		}
+		content = strings.Join(items, "\n")
+	case GroupDialogMoveGroup:
+		title = "Move Group Into"
+		var items []string
+		for i := range g.groupPaths {
+			displayName := g.groupPaths[i]
+			if i < len(g.groupNames) && g.groupNames[i] != "" {
+				displayName = g.groupNames[i]
+			}
+			if i == g.selected {
+				items = append(items, lipgloss.NewStyle().
+					Foreground(ColorBg).
+					Background(ColorAccent).
+					Bold(true).
+					Padding(0, 1).
+					Render(displayName))
+			} else {
+				items = append(items, lipgloss.NewStyle().
+					Foreground(ColorText).
+					Padding(0, 1).
+					Render(displayName))
 			}
 		}
 		content = strings.Join(items, "\n")

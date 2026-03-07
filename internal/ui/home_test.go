@@ -279,10 +279,10 @@ func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 	}
 
 	tree := session.NewGroupTree([]*session.Instance{})
-	tree.CreateGroup("work")
-	tree.CreateSubgroup("work", "frontend")
-	tree.CreateGroup("play")
-	tree.CreateSubgroup("play", "frontend")
+	workGroup := tree.CreateGroup("work")
+	tree.CreateSubgroup(workGroup.Path, "frontend")
+	playGroup := tree.CreateGroup("play")
+	playFrontend := tree.CreateSubgroup(playGroup.Path, "frontend")
 	tree.AddSession(inst)
 
 	home.instancesMu.Lock()
@@ -315,7 +315,7 @@ func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 
 	targetIdx := -1
 	for i, path := range h.groupDialog.groupPaths {
-		if path == "play/frontend" {
+		if path == playFrontend.Path {
 			targetIdx = i
 			break
 		}
@@ -335,8 +335,8 @@ func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 	if moved == nil {
 		t.Fatal("moved instance not found by ID")
 	}
-	if moved.GroupPath != "play/frontend" {
-		t.Fatalf("GroupPath = %q, want %q", moved.GroupPath, "play/frontend")
+	if moved.GroupPath != playFrontend.Path {
+		t.Fatalf("GroupPath = %q, want %q", moved.GroupPath, playFrontend.Path)
 	}
 }
 

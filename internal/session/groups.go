@@ -768,6 +768,132 @@ func (t *GroupTree) RenameGroup(path, newName string) {
 	group.Name = sanitizeGroupName(newName)
 }
 
+// ReparentGroup moves a group (and all its descendants) under a new parent.
+// Pass "" as newParentPath to move to root level.
+// Returns false if the move is invalid (e.g., moving into itself or a descendant).
+func (t *GroupTree) ReparentGroup(groupPath, newParentPath string) bool {
+	group, exists := t.Groups[groupPath]
+	if !exists {
+		return false
+	}
+
+	// Can't move into itself or a descendant
+	if newParentPath == groupPath || strings.HasPrefix(newParentPath, groupPath+"/") {
+		return false
+	}
+
+	// Can't move to current parent (no-op)
+	currentParent := getParentPath(groupPath)
+	if currentParent == newParentPath {
+		return false
+	}
+
+	// If target parent doesn't exist (and isn't root), fail
+	if newParentPath != "" {
+		if _, exists := t.Groups[newParentPath]; !exists {
+			return false
+		}
+	}
+
+	// Extract the leaf segment of the current path (the random ID)
+	leaf := groupPath
+	if idx := strings.LastIndex(groupPath, "/"); idx != -1 {
+		leaf = groupPath[idx+1:]
+	}
+
+	// Build new path
+	var newPath string
+	if newParentPath == "" {
+		newPath = leaf
+	} else {
+		newPath = newParentPath + "/" + leaf
+	}
+
+	// If path didn't change, nothing to do
+	if newPath == groupPath {
+		return false
+	}
+
+	// Collect all groups to reparent (the group itself + descendants)
+	oldPaths := []string{groupPath}
+	for p := range t.Groups {
+		if strings.HasPrefix(p, groupPath+"/") {
+			oldPaths = append(oldPaths, p)
+		}
+	}
+
+	// Remap all paths
+	for _, oldPath := range oldPaths {
+		g := t.Groups[oldPath]
+		suffix := strings.TrimPrefix(oldPath, groupPath)
+		remappedPath := newPath + suffix
+
+		// Update group's path
+		g.Path = remappedPath
+
+		// Update all sessions' GroupPath
+		for _, sess := range g.Sessions {
+			sess.GroupPath = remappedPath
+		}
+
+		// Move in maps
+		delete(t.Groups, oldPath)
+		t.Groups[remappedPath] = g
+
+		if expanded, ok := t.Expanded[oldPath]; ok {
+			delete(t.Expanded, oldPath)
+			t.Expanded[remappedPath] = expanded
+		}
+	}
+
+	// Update the moved group's sibling order
+	siblingCount := 0
+	for p := range t.Groups {
+		if getParentPath(p) == newParentPath && p != newPath {
+			siblingCount++
+		}
+	}
+	group.Order = siblingCount
+
+	t.rebuildGroupList()
+	return true
+}
+
+// GetValidMoveTargetsForGroup returns paths and names of groups that are valid
+// targets for reparenting the given group (excludes self, descendants, and current parent).
+// Includes "" (root level) as the first option if the group isn't already at root.
+func (t *GroupTree) GetValidMoveTargetsForGroup(groupPath string) (paths []string, names []string) {
+	currentParent := getParentPath(groupPath)
+
+	for _, g := range t.GroupList {
+		// Skip self
+		if g.Path == groupPath {
+			continue
+		}
+		// Skip descendants
+		if strings.HasPrefix(g.Path, groupPath+"/") {
+			continue
+		}
+		// Skip current parent (would be no-op)
+		if g.Path == currentParent {
+			continue
+		}
+		// Skip default group
+		if g.Path == DefaultGroupPath {
+			continue
+		}
+		paths = append(paths, g.Path)
+		names = append(names, g.Name)
+	}
+
+	// Offer ungroup at the bottom if currently nested
+	if currentParent != "" {
+		paths = append(paths, "")
+		names = append(names, "Ungroup (move to root)")
+	}
+	return
+}
+
 // DeleteGroup deletes a group, all its subgroups, and moves all sessions to default
 func (t *GroupTree) DeleteGroup(path string) []*Instance {
 	group, exists := t.Groups[path]
