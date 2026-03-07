@@ -959,6 +959,69 @@ func TestExtractGroupName(t *testing.T) {
 	}
 }
 
+func TestIsRandomGroupID(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"g-0c89a657", true},
+		{"g-abcdef01", true},
+		{"g-00000000", true},
+		{"my-project", false},
+		{"g-", false},
+		{"g-0c89a65", false},  // too short
+		{"g-0c89a6570", false}, // too long
+		{"g-ABCDEF01", false}, // uppercase
+		{"g-0c89g657", false}, // non-hex char
+		{"voice", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		result := isRandomGroupID(tt.input)
+		if result != tt.expected {
+			t.Errorf("isRandomGroupID(%q) = %v, want %v", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestDisplayNameFromPath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"voice", "voice"},
+		{"g-0c89a657", "Unnamed Group"},
+		{"parent/g-abcdef01", "Unnamed Group"},
+		{"g-0c89a657/child", "child"},
+		{"my-sessions", "my-sessions"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		result := displayNameFromPath(tt.path)
+		if result != tt.expected {
+			t.Errorf("displayNameFromPath(%q) = %q, want %q", tt.path, result, tt.expected)
+		}
+	}
+}
+
+func TestNewGroupTreeRandomIDGetsUnnamedGroup(t *testing.T) {
+	// When a session has a random group ID path, the group name should
+	// be "Unnamed Group" instead of the raw random ID
+	instances := []*Instance{
+		{ID: "1", Title: "test", GroupPath: "g-0c89a657"},
+	}
+	tree := NewGroupTree(instances)
+	group := tree.Groups["g-0c89a657"]
+	if group == nil {
+		t.Fatal("group not found")
+	}
+	if group.Name != "Unnamed Group" {
+		t.Errorf("Expected name 'Unnamed Group', got %q", group.Name)
+	}
+}
+
 func TestNewGroupTreeWithHierarchicalPath(t *testing.T) {
 	// Simulate session created with hierarchical group path
 	instances := []*Instance{

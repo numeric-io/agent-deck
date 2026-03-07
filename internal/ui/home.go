@@ -2506,10 +2506,12 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				// Refresh - update existing tree with loaded sessions AND groups
-				// Preserve expanded state before recreating tree
+				// Preserve expanded state and group names before recreating tree
 				expandedState := make(map[string]bool)
+				oldGroupNames := make(map[string]string)
 				for path, group := range h.groupTree.Groups {
 					expandedState[path] = group.Expanded
+					oldGroupNames[path] = group.Name
 				}
 				// Recreate tree with fresh groups from storage
 				if len(msg.groups) > 0 {
@@ -2517,10 +2519,19 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					h.groupTree = session.NewGroupTree(h.instances)
 				}
-				// Restore expanded state for groups that still exist
+				// Restore expanded state and group names for groups that still exist
 				for path, expanded := range expandedState {
 					if group, exists := h.groupTree.Groups[path]; exists {
 						group.Expanded = expanded
+					}
+				}
+				// When stored groups were empty (fallback to NewGroupTree),
+				// restore proper names from the previous in-memory tree
+				if len(msg.groups) == 0 {
+					for path, name := range oldGroupNames {
+						if group, exists := h.groupTree.Groups[path]; exists {
+							group.Name = name
+						}
 					}
 				}
 			}
