@@ -495,6 +495,11 @@ type worktreeFinishResultMsg struct {
 	targetBranch string
 	merged       bool
 	err          error
+	// Post-delete cleanup hooks that require user confirmation
+	pendingCleanupHooks  []git.WorktreeHook
+	cleanupRepoDir       string
+	cleanupWorktreePath  string
+	cleanupBranch        string
 }
 
 // statusUpdateRequest is sent to the background worker with current viewport info
@@ -2786,6 +2791,26 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if deletedInstance != nil {
 			h.setError(fmt.Errorf("deleted '%s'. Ctrl+Z to undo", deletedInstance.Title))
 		}
+
+		// If there are cleanup hooks requiring confirmation, show the dialog
+		if len(msg.pendingCleanupHooks) > 0 {
+			h.confirmDialog.ShowWorktreeCleanup(
+				msg.pendingCleanupHooks,
+				msg.cleanupRepoDir,
+				msg.cleanupWorktreePath,
+				msg.cleanupBranch,
+			)
+		}
+		return h, nil
+
+	case worktreeCleanupDoneMsg:
+		if len(msg.errors) > 0 {
+			var errMsgs []string
+			for _, e := range msg.errors {
+				errMsgs = append(errMsgs, e.Error())
+			}
+			h.setError(fmt.Errorf("cleanup hook errors: %s", strings.Join(errMsgs, "; ")))
+		}
 		return h, nil
 
 	case sessionRestoredMsg:
@@ -3308,6 +3333,16 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			successMsg += fmt.Sprintf(", merged into %s", msg.targetBranch)
 		}
 		h.setError(fmt.Errorf("%s", successMsg))
+
+		// If there are cleanup hooks requiring confirmation, show the dialog
+		if len(msg.pendingCleanupHooks) > 0 {
+			h.confirmDialog.ShowWorktreeCleanup(
+				msg.pendingCleanupHooks,
+				msg.cleanupRepoDir,
+				msg.cleanupWorktreePath,
+				msg.cleanupBranch,
+			)
+		}
 		return h, nil
 
 	case copyResultMsg:
@@ -4759,6 +4794,10 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.instancesMu.Unlock()
 				h.rebuildFlatItems()
 				h.forceSaveInstances()
+			case ConfirmWorktreeCleanup:
+				hooks, repoDir, worktreePath, branch := h.confirmDialog.GetPendingCleanup()
+				h.confirmDialog.Hide()
+				return h, h.runWorktreeCleanupHooks(hooks, repoDir, worktreePath, branch)
 			}
 			h.confirmDialog.Hide()
 			return h, nil
@@ -5465,6 +5504,16 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			return sessionCreatedMsg{err: err}
 		}
 		uiLog.Info("session_create_succeeded", slog.String("id", inst.ID))
+
+		// Run post-worktree hook in background so the session appears immediately
+		if worktreePath != "" && worktreeRepoRoot != "" && worktreeBranch != "" {
+			go func() {
+				if err := git.RunPostWorktreeHook(worktreeRepoRoot, worktreePath, worktreeBranch); err != nil {
+					uiLog.Warn("post_worktree_hook_failed", slog.String("error", err.Error()))
+				}
+			}()
+		}
+
 		return sessionCreatedMsg{instance: inst}
 	}
 }
@@ -5679,6 +5728,15 @@ func (h *Home) forkSessionCmdWithOptions(
 			go inst.DetectOpenCodeSession()
 		}
 
+		// Run post-worktree hook in background so the session appears immediately
+		if opts != nil && opts.WorktreePath != "" && opts.WorktreeRepoRoot != "" && opts.WorktreeBranch != "" {
+			go func() {
+				if err := git.RunPostWorktreeHook(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch); err != nil {
+					uiLog.Warn("post_worktree_hook_failed", slog.String("error", err.Error()))
+				}
+			}()
+		}
+
 		return sessionForkedMsg{instance: inst, sourceID: sourceID}
 	}
 }
@@ -5687,6 +5745,11 @@ func (h *Home) forkSessionCmdWithOptions(
 type sessionDeletedMsg struct {
 	deletedID string
 	killErr   error // Error from Kill() if any
+	// Post-delete cleanup hooks that require user confirmation
+	pendingCleanupHooks  []git.WorktreeHook
+	cleanupRepoDir       string
+	cleanupWorktreePath  string
+	cleanupBranch        string
 }
 
 // sessionRestoredMsg signals that an undo-delete restore completed
@@ -5701,13 +5764,54 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	isWorktree := inst.IsWorktree()
 	worktreePath := inst.WorktreePath
 	worktreeRepoRoot := inst.WorktreeRepoRoot
+	worktreeBranch := inst.WorktreeBranch
 	return func() tea.Msg {
 		killErr := inst.Kill()
+		msg := sessionDeletedMsg{deletedID: id, killErr: killErr}
 		if isWorktree {
+			// Run immediate (no-confirmation) delete hooks before removing the worktree
+			immediate, confirm := git.GetDeleteHooks(worktreeRepoRoot)
+			for _, hook := range immediate {
+				if err := git.RunWorktreeHook(worktreeRepoRoot, worktreePath, worktreeBranch, hook); err != nil {
+					uiLog.Warn("worktree_delete_hook_failed",
+						slog.String("hook", hook.File),
+						slog.String("error", err.Error()))
+				}
+			}
+
 			_ = git.RemoveWorktree(worktreeRepoRoot, worktreePath, false)
 			_ = git.PruneWorktrees(worktreeRepoRoot)
+
+			// Attach hooks that need confirmation
+			if len(confirm) > 0 {
+				msg.pendingCleanupHooks = confirm
+				msg.cleanupRepoDir = worktreeRepoRoot
+				msg.cleanupWorktreePath = worktreePath
+				msg.cleanupBranch = worktreeBranch
+			}
 		}
-		return sessionDeletedMsg{deletedID: id, killErr: killErr}
+		return msg
+	}
+}
+
+// worktreeCleanupDoneMsg signals that post-delete cleanup hooks finished.
+type worktreeCleanupDoneMsg struct {
+	errors []error
+}
+
+// runWorktreeCleanupHooks runs the given hooks in the background.
+func (h *Home) runWorktreeCleanupHooks(hooks []git.WorktreeHook, repoDir, worktreePath, branch string) tea.Cmd {
+	return func() tea.Msg {
+		var errs []error
+		for _, hook := range hooks {
+			if err := git.RunWorktreeHook(repoDir, worktreePath, branch, hook); err != nil {
+				uiLog.Warn("worktree_cleanup_hook_failed",
+					slog.String("hook", hook.File),
+					slog.String("error", err.Error()))
+				errs = append(errs, fmt.Errorf("%s: %w", hook.File, err))
+			}
+		}
+		return worktreeCleanupDoneMsg{errors: errs}
 	}
 }
 
@@ -9593,28 +9697,42 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 			merged = true
 		}
 
-		// Step 2: Remove worktree
+		// Step 2: Run immediate delete hooks (before worktree removal)
+		immediate, confirm := git.GetDeleteHooks(repoRoot)
+		for _, hook := range immediate {
+			if err := git.RunWorktreeHook(repoRoot, worktreePath, branchName, hook); err != nil {
+				uiLog.Warn("worktree_finish_delete_hook_failed",
+					slog.String("hook", hook.File),
+					slog.String("error", err.Error()))
+			}
+		}
+
+		// Step 3: Remove worktree
 		if _, statErr := os.Stat(worktreePath); !os.IsNotExist(statErr) {
 			_ = git.RemoveWorktree(repoRoot, worktreePath, false)
 		}
 		_ = git.PruneWorktrees(repoRoot)
 
-		// Step 3: Delete branch (if not keeping)
+		// Step 4: Delete branch (if not keeping)
 		if !keepBranch {
 			// Use force delete if we merged (branch is fully merged), regular delete otherwise
 			_ = git.DeleteBranch(repoRoot, branchName, merged)
 		}
 
-		// Step 4: Kill tmux session
+		// Step 5: Kill tmux session
 		if inst != nil && inst.Exists() {
 			_ = inst.Kill()
 		}
 
 		return worktreeFinishResultMsg{
-			sessionID:    sessionID,
-			sessionTitle: sessionTitle,
-			targetBranch: targetBranch,
-			merged:       merged,
+			sessionID:            sessionID,
+			sessionTitle:         sessionTitle,
+			targetBranch:         targetBranch,
+			merged:               merged,
+			pendingCleanupHooks:  confirm,
+			cleanupRepoDir:       repoRoot,
+			cleanupWorktreePath:  worktreePath,
+			cleanupBranch:        branchName,
 		}
 	}
 }

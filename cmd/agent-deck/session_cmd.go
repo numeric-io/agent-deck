@@ -493,6 +493,9 @@ func handleSessionFork(profile string, args []string) {
 			out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+		if err := git.RunPostWorktreeHook(repoRoot, worktreePath, wtBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+		}
 
 		userConfig, _ := session.LoadUserConfig()
 		opts = session.NewClaudeOptions(userConfig)

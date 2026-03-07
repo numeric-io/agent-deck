@@ -469,6 +469,15 @@ func handleWorktreeCleanup(profile string, args []string) {
 	// Remove orphaned worktrees
 	removedWorktrees := 0
 	for _, wt := range orphanedWorktrees {
+		// Run delete hooks before removing the worktree
+		immediate, confirm := git.GetDeleteHooks(repoRoot)
+		allHooks := append(immediate, confirm...)
+		for _, hook := range allHooks {
+			if err := git.RunWorktreeHook(repoRoot, wt.Path, wt.Branch, hook); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: delete hook %s failed for %s: %v\n", hook.File, wt.Path, err)
+			}
+		}
+
 		if err := git.RemoveWorktree(repoRoot, wt.Path, false); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to remove worktree %s: %v\n", wt.Path, err)
 			continue
@@ -633,7 +642,21 @@ func handleWorktreeFinish(profile string, args []string) {
 		fmt.Printf("  %s Merged successfully\n", successSymbol)
 	}
 
-	// Step 2: Remove worktree
+	// Step 2: Run delete hooks before removing the worktree
+	immediate, confirm := git.GetDeleteHooks(repoRoot)
+	allDeleteHooks := append(immediate, confirm...)
+	for _, hook := range allDeleteHooks {
+		if hook.ConfirmMessage != "" {
+			fmt.Printf("Running cleanup: %s\n", hook.ConfirmMessage)
+		}
+		if err := git.RunWorktreeHook(repoRoot, worktreePath, worktreeBranch, hook); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: delete hook %s failed: %v\n", hook.File, err)
+		} else {
+			fmt.Printf("  %s Delete hook %s completed\n", successSymbol, hook.Name)
+		}
+	}
+
+	// Step 3: Remove worktree
 	if _, statErr := os.Stat(worktreePath); !os.IsNotExist(statErr) {
 		fmt.Printf("Removing worktree at %s...\n", FormatPath(worktreePath))
 		if err := git.RemoveWorktree(repoRoot, worktreePath, *force); err != nil {
@@ -644,7 +667,7 @@ func handleWorktreeFinish(profile string, args []string) {
 	}
 	_ = git.PruneWorktrees(repoRoot)
 
-	// Step 3: Delete branch (if not --keep-branch)
+	// Step 4: Delete branch (if not --keep-branch)
 	if !*keepBranch {
 		fmt.Printf("Deleting branch %s...\n", worktreeBranch)
 		if err := git.DeleteBranch(repoRoot, worktreeBranch, *force); err != nil {
@@ -654,14 +677,14 @@ func handleWorktreeFinish(profile string, args []string) {
 		}
 	}
 
-	// Step 4: Kill tmux session
+	// Step 5: Kill tmux session
 	if inst.Exists() {
 		if err := inst.Kill(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to kill tmux session: %v\n", err)
 		}
 	}
 
-	// Step 5: Remove session from agent-deck
+	// Step 6: Remove session from agent-deck
 	var remaining []*session.Instance
 	for _, i := range instances {
 		if i.ID != inst.ID {

@@ -7,6 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/asheshgoplani/agent-deck/internal/git"
 )
 
 // ConfirmType indicates what action is being confirmed
@@ -18,6 +20,7 @@ const (
 	ConfirmQuitWithPool
 	ConfirmCreateDirectory
 	ConfirmInstallHooks
+	ConfirmWorktreeCleanup
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -37,6 +40,12 @@ type ConfirmDialog struct {
 	pendingSessionCommand   string
 	pendingSessionGroupPath string
 	pendingToolOptionsJSON  json.RawMessage // Generic tool options (claude, codex, etc.)
+
+	// Pending worktree cleanup data (for ConfirmWorktreeCleanup)
+	pendingCleanupHooks        []git.WorktreeHook
+	pendingCleanupRepoDir      string
+	pendingCleanupWorktreePath string
+	pendingCleanupBranch       string
 }
 
 // NewConfirmDialog creates a new confirmation dialog
@@ -95,6 +104,28 @@ func (c *ConfirmDialog) ShowInstallHooks() {
 	c.confirmType = ConfirmInstallHooks
 	c.targetID = ""
 	c.targetName = ""
+}
+
+// ShowWorktreeCleanup shows confirmation for post-delete worktree cleanup hooks.
+func (c *ConfirmDialog) ShowWorktreeCleanup(hooks []git.WorktreeHook, repoDir, worktreePath, branch string) {
+	c.visible = true
+	c.confirmType = ConfirmWorktreeCleanup
+	c.pendingCleanupHooks = hooks
+	c.pendingCleanupRepoDir = repoDir
+	c.pendingCleanupWorktreePath = worktreePath
+	c.pendingCleanupBranch = branch
+
+	// Build target name from hook details for display
+	var names []string
+	for _, h := range hooks {
+		names = append(names, h.Name)
+	}
+	c.targetName = strings.Join(names, ", ")
+}
+
+// GetPendingCleanup returns the pending worktree cleanup data.
+func (c *ConfirmDialog) GetPendingCleanup() ([]git.WorktreeHook, string, string, string) {
+	return c.pendingCleanupHooks, c.pendingCleanupRepoDir, c.pendingCleanupWorktreePath, c.pendingCleanupBranch
 }
 
 // GetPendingSession returns the pending session creation data
@@ -263,6 +294,38 @@ func (c *ConfirmDialog) View() string {
 			Padding(0, 2).
 			Bold(true).
 			Render("y Install")
+		buttonNo := lipgloss.NewStyle().
+			Foreground(ColorBg).
+			Background(ColorAccent).
+			Padding(0, 2).
+			Bold(true).
+			Render("n Skip")
+		escHint := lipgloss.NewStyle().
+			Foreground(ColorTextDim).
+			Render("(Esc to skip)")
+		buttons = lipgloss.JoinHorizontal(lipgloss.Center, buttonYes, "  ", buttonNo, "  ", escHint)
+
+	case ConfirmWorktreeCleanup:
+		title = "⚠  Worktree Cleanup"
+		// Build details from hook confirmMessage or file names
+		var hookDetails []string
+		for _, hook := range c.pendingCleanupHooks {
+			if hook.ConfirmMessage != "" {
+				hookDetails = append(hookDetails, "• "+hook.ConfirmMessage)
+			} else {
+				hookDetails = append(hookDetails, fmt.Sprintf("• Run %s", hook.File))
+			}
+		}
+		warning = "The following cleanup actions require confirmation:"
+		details = strings.Join(hookDetails, "\n")
+		borderColor = ColorYellow
+
+		buttonYes := lipgloss.NewStyle().
+			Foreground(ColorBg).
+			Background(ColorRed).
+			Padding(0, 2).
+			Bold(true).
+			Render("y Run")
 		buttonNo := lipgloss.NewStyle().
 			Foreground(ColorBg).
 			Background(ColorAccent).

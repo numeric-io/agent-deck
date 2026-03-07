@@ -193,6 +193,9 @@ func handleLaunch(profile string, args []string) {
 			out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+		if err := git.RunPostWorktreeHook(repoRoot, worktreePath, wtBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+		}
 
 		worktreeRepoRoot = repoRoot
 		path = worktreePath

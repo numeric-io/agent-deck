@@ -959,6 +959,9 @@ func handleAdd(profile string, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
 			os.Exit(1)
 		}
+		if err := git.RunPostWorktreeHook(repoRoot, worktreePath, wtBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+		}
 
 		fmt.Printf("Created worktree at: %s\n", worktreePath)
 		worktreeRepoRoot = repoRoot
@@ -1460,6 +1463,20 @@ func handleRemove(profile string, args []string) {
 
 	// Clean up worktree directory if this is a worktree session
 	if inst.IsWorktree() {
+		// Run all delete hooks (immediate + confirm) before removing the worktree
+		immediate, confirm := git.GetDeleteHooks(inst.WorktreeRepoRoot)
+		allHooks := append(immediate, confirm...)
+		for _, hook := range allHooks {
+			if hook.ConfirmMessage != "" && !*jsonOutput {
+				fmt.Printf("Running cleanup: %s\n", hook.ConfirmMessage)
+			}
+			if err := git.RunWorktreeHook(inst.WorktreeRepoRoot, inst.WorktreePath, inst.WorktreeBranch, hook); err != nil {
+				if !*jsonOutput {
+					fmt.Printf("Warning: delete hook %s failed: %v\n", hook.File, err)
+				}
+			}
+		}
+
 		if err := git.RemoveWorktree(inst.WorktreeRepoRoot, inst.WorktreePath, false); err != nil {
 			if !*jsonOutput {
 				fmt.Printf("Warning: failed to remove worktree: %v\n", err)

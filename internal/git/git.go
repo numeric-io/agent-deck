@@ -3,6 +3,7 @@ package git
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -164,10 +165,6 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 		return fmt.Errorf("failed to create worktree: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 
-	if err := RunPostWorktreeHook(repoDir, worktreePath, branchName); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
-	}
-
 	return nil
 }
 
@@ -192,6 +189,110 @@ func RunPostWorktreeHook(repoDir, worktreePath, branchName string) error {
 
 	cmd := exec.Command("bash", hookPath)
 	cmd.Dir = worktreePath
+	cmd.Env = append(os.Environ(),
+		"REPO_ROOT="+repoDir,
+		"WORKTREE_PATH="+worktreePath,
+		"BRANCH="+branchName,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	return nil
+}
+
+// WorktreeHookConfig represents the config.json in a worktree-config/<project>/ directory.
+type WorktreeHookConfig struct {
+	Hooks map[string]WorktreeHook `json:"hooks"`
+}
+
+// WorktreeHook defines a single hook entry in the config.
+type WorktreeHook struct {
+	Name                string `json:"-"` // Populated from the map key
+	File                string `json:"file"`
+	RequireConfirmation bool   `json:"requireConfirmation"`
+	ConfirmMessage      string `json:"confirmMessage"`
+}
+
+// LoadWorktreeHookConfig loads config.json from ~/.agent-deck/worktree-config/<project>/.
+// Returns nil with no error if the file doesn't exist.
+func LoadWorktreeHookConfig(repoDir string) (*WorktreeHookConfig, error) {
+	projectName := filepath.Base(repoDir)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	configPath := filepath.Join(home, ".agent-deck", "worktree-config", projectName, "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read worktree hook config: %w", err)
+	}
+
+	var cfg WorktreeHookConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse worktree hook config: %w", err)
+	}
+
+	// Populate Name field from map keys
+	populated := make(map[string]WorktreeHook, len(cfg.Hooks))
+	for k, v := range cfg.Hooks {
+		v.Name = k
+		populated[k] = v
+	}
+	cfg.Hooks = populated
+
+	return &cfg, nil
+}
+
+// GetDeleteHooks loads config.json and returns ON_DELETE hooks partitioned into
+// immediate (no confirmation needed) and confirm (require user confirmation) slices.
+func GetDeleteHooks(repoDir string) (immediate []WorktreeHook, confirm []WorktreeHook) {
+	cfg, err := LoadWorktreeHookConfig(repoDir)
+	if err != nil || cfg == nil {
+		return nil, nil
+	}
+
+	for name, hook := range cfg.Hooks {
+		if !strings.HasPrefix(name, "ON_DELETE") {
+			continue
+		}
+		if hook.RequireConfirmation {
+			confirm = append(confirm, hook)
+		} else {
+			immediate = append(immediate, hook)
+		}
+	}
+	return immediate, confirm
+}
+
+// RunWorktreeHook runs a single hook script from the worktree-config directory.
+// The script receives REPO_ROOT, WORKTREE_PATH, and BRANCH as environment variables.
+// If worktreePath still exists it is used as cwd, otherwise repoDir is used.
+func RunWorktreeHook(repoDir, worktreePath, branchName string, hook WorktreeHook) error {
+	projectName := filepath.Base(repoDir)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	hookPath := filepath.Join(home, ".agent-deck", "worktree-config", projectName, hook.File)
+	if _, err := os.Stat(hookPath); os.IsNotExist(err) {
+		return fmt.Errorf("hook script not found: %s", hookPath)
+	}
+
+	cwd := worktreePath
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		cwd = repoDir
+	}
+
+	cmd := exec.Command("bash", hookPath)
+	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(),
 		"REPO_ROOT="+repoDir,
 		"WORKTREE_PATH="+worktreePath,
