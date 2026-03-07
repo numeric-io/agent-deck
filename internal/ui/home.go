@@ -4266,11 +4266,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession {
-				h.groupDialog.ShowMove(h.groupTree.GetGroupPaths(), h.groupTree.GetGroupNames())
+				paths, names, levels := h.groupTree.GetGroupInfo()
+				h.groupDialog.ShowMove(paths, names, levels)
 			} else if item.Type == session.ItemTypeGroup && item.Path != session.DefaultGroupPath {
-				paths, names := h.groupTree.GetValidMoveTargetsForGroup(item.Path)
+				paths, names, levels := h.groupTree.GetValidMoveTargetsForGroup(item.Path)
 				if len(paths) > 0 {
-					h.groupDialog.ShowMoveGroup(item.Path, paths, names)
+					h.groupDialog.ShowMoveGroup(item.Path, paths, names, levels)
 				}
 			}
 		}

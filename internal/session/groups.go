@@ -862,7 +862,7 @@ func (t *GroupTree) ReparentGroup(groupPath, newParentPath string) bool {
 // GetValidMoveTargetsForGroup returns paths and names of groups that are valid
 // targets for reparenting the given group (excludes self, descendants, and current parent).
 // Includes "" (root level) as the first option if the group isn't already at root.
-func (t *GroupTree) GetValidMoveTargetsForGroup(groupPath string) (paths []string, names []string) {
+func (t *GroupTree) GetValidMoveTargetsForGroup(groupPath string) (paths []string, names []string, levels []int) {
 	currentParent := getParentPath(groupPath)
 
 	for _, g := range t.GroupList {
@@ -884,12 +884,14 @@ func (t *GroupTree) GetValidMoveTargetsForGroup(groupPath string) (paths []strin
 		}
 		paths = append(paths, g.Path)
 		names = append(names, g.Name)
+		levels = append(levels, GetGroupLevel(g.Path))
 	}
 
 	// Offer ungroup at the bottom if currently nested
 	if currentParent != "" {
 		paths = append(paths, "")
 		names = append(names, "Ungroup (move to root)")
+		levels = append(levels, 0)
 	}
 	return
 }
@@ -1054,6 +1056,19 @@ func (t *GroupTree) GetGroupPaths() []string {
 		paths[i] = g.Path
 	}
 	return paths
+}
+
+// GetGroupInfo returns paths, names, and indent levels for all groups in tree order.
+func (t *GroupTree) GetGroupInfo() (paths, names []string, levels []int) {
+	paths = make([]string, len(t.GroupList))
+	names = make([]string, len(t.GroupList))
+	levels = make([]int, len(t.GroupList))
+	for i, g := range t.GroupList {
+		paths[i] = g.Path
+		names[i] = g.Name
+		levels[i] = GetGroupLevel(g.Path)
+	}
+	return
 }
 
 // SyncWithInstances updates the tree with a new set of instances

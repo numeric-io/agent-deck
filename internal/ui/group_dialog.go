@@ -31,6 +31,7 @@ type GroupDialog struct {
 	parentName    string   // Display name of parent group (for subgroup creation)
 	groupPaths    []string // Available target group paths (for move)
 	groupNames    []string // Display names corresponding to groupPaths (for move)
+	groupLevels   []int    // Indent levels for tree rendering (for move)
 	selected      int      // Selected group index (for move)
 	sessionID     string   // Session ID being renamed (for rename session)
 	validationErr string   // Inline validation error displayed inside the dialog
@@ -149,23 +150,25 @@ func (g *GroupDialog) ShowRename(currentPath, currentName string) {
 }
 
 // ShowMove shows the dialog for moving a session to a group path.
-func (g *GroupDialog) ShowMove(groupPaths, groupNames []string) {
+func (g *GroupDialog) ShowMove(groupPaths, groupNames []string, groupLevels []int) {
 	g.visible = true
 	g.mode = GroupDialogMove
 	g.validationErr = ""
 	g.groupPaths = groupPaths
 	g.groupNames = groupNames
+	g.groupLevels = groupLevels
 	g.selected = 0
 }
 
 // ShowMoveGroup shows the dialog for moving a group into another group.
-func (g *GroupDialog) ShowMoveGroup(groupPath string, targetPaths, targetNames []string) {
+func (g *GroupDialog) ShowMoveGroup(groupPath string, targetPaths, targetNames []string, targetLevels []int) {
 	g.visible = true
 	g.mode = GroupDialogMoveGroup
 	g.validationErr = ""
 	g.groupPath = groupPath
 	g.groupPaths = targetPaths
 	g.groupNames = targetNames
+	g.groupLevels = targetLevels
 	g.selected = 0
 }
 
@@ -303,6 +306,43 @@ func (g *GroupDialog) Update(msg tea.KeyMsg) (*GroupDialog, tea.Cmd) {
 }
 
 // View renders the dialog
+// renderMoveList renders the group list with tree-style indentation for move dialogs.
+func (g *GroupDialog) renderMoveList() string {
+	var items []string
+	for i := range g.groupPaths {
+		displayName := g.groupPaths[i]
+		if i < len(g.groupNames) && g.groupNames[i] != "" {
+			displayName = g.groupNames[i]
+		}
+
+		// Build tree-style indent prefix
+		level := 0
+		if i < len(g.groupLevels) {
+			level = g.groupLevels[i]
+		}
+		prefix := ""
+		if level > 0 {
+			prefix = strings.Repeat("  ", level-1) + "└ "
+		}
+
+		label := prefix + displayName
+		if i == g.selected {
+			items = append(items, lipgloss.NewStyle().
+				Foreground(ColorBg).
+				Background(ColorAccent).
+				Bold(true).
+				Padding(0, 1).
+				Render(label))
+		} else {
+			items = append(items, lipgloss.NewStyle().
+				Foreground(ColorText).
+				Padding(0, 1).
+				Render(label))
+		}
+	}
+	return strings.Join(items, "\n")
+}
+
 func (g *GroupDialog) View() string {
 	if !g.visible {
 		return ""
@@ -346,50 +386,10 @@ func (g *GroupDialog) View() string {
 		content = g.nameInput.View()
 	case GroupDialogMove:
 		title = "Move to Group"
-		var items []string
-		for i := range g.groupPaths {
-			displayName := g.groupPaths[i]
-			if i < len(g.groupNames) && g.groupNames[i] != "" {
-				displayName = g.groupNames[i]
-			}
-			if i == g.selected {
-				items = append(items, lipgloss.NewStyle().
-					Foreground(ColorBg).
-					Background(ColorAccent).
-					Bold(true).
-					Padding(0, 1).
-					Render(displayName))
-			} else {
-				items = append(items, lipgloss.NewStyle().
-					Foreground(ColorText).
-					Padding(0, 1).
-					Render(displayName))
-			}
-		}
-		content = strings.Join(items, "\n")
+		content = g.renderMoveList()
 	case GroupDialogMoveGroup:
 		title = "Move Group Into"
-		var items []string
-		for i := range g.groupPaths {
-			displayName := g.groupPaths[i]
-			if i < len(g.groupNames) && g.groupNames[i] != "" {
-				displayName = g.groupNames[i]
-			}
-			if i == g.selected {
-				items = append(items, lipgloss.NewStyle().
-					Foreground(ColorBg).
-					Background(ColorAccent).
-					Bold(true).
-					Padding(0, 1).
-					Render(displayName))
-			} else {
-				items = append(items, lipgloss.NewStyle().
-					Foreground(ColorText).
-					Padding(0, 1).
-					Render(displayName))
-			}
-		}
-		content = strings.Join(items, "\n")
+		content = g.renderMoveList()
 	case GroupDialogRenameSession:
 		title = "Rename Session"
 		content = g.nameInput.View()
