@@ -420,8 +420,13 @@ func (g *GroupDialog) View() string {
 		errContent = errStyle.Render("⚠ " + g.validationErr)
 	}
 
+	contentAlign := lipgloss.Center
+	if g.mode == GroupDialogMove || g.mode == GroupDialogMoveGroup {
+		contentAlign = lipgloss.Left
+	}
+
 	dialogContent := lipgloss.JoinVertical(
-		lipgloss.Center,
+		contentAlign,
 		titleStyle.Render(title),
 		"",
 		content,
