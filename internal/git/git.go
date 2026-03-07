@@ -168,41 +168,6 @@ func CreateWorktree(repoDir, worktreePath, branchName string) error {
 	return nil
 }
 
-// RunPostWorktreeHook runs a project-specific post-worktree hook script if one exists.
-// Hook scripts are located at ~/.agent-deck/worktree-config/<project>/POST_HOOK.sh
-// where <project> is the basename of repoDir.
-// The script runs with cwd set to worktreePath and receives REPO_ROOT,
-// WORKTREE_PATH, and BRANCH as environment variables.
-func RunPostWorktreeHook(repoDir, worktreePath, branchName string) error {
-	projectName := filepath.Base(repoDir)
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
-	}
-
-	hookPath := filepath.Join(home, ".agent-deck", "worktree-config", projectName, "POST_HOOK.sh")
-
-	if _, err := os.Stat(hookPath); os.IsNotExist(err) {
-		return nil
-	}
-
-	cmd := exec.Command("bash", hookPath)
-	cmd.Dir = worktreePath
-	cmd.Env = append(os.Environ(),
-		"REPO_ROOT="+repoDir,
-		"WORKTREE_PATH="+worktreePath,
-		"BRANCH="+branchName,
-	)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
-	}
-
-	return nil
-}
-
 // WorktreeHookConfig represents the config.json in a worktree-config/<project>/ directory.
 type WorktreeHookConfig struct {
 	Hooks map[string]WorktreeHook `json:"hooks"`
@@ -248,6 +213,22 @@ func LoadWorktreeHookConfig(repoDir string) (*WorktreeHookConfig, error) {
 	cfg.Hooks = populated
 
 	return &cfg, nil
+}
+
+// GetCreateHooks loads config.json and returns ON_CREATE hooks.
+func GetCreateHooks(repoDir string) []WorktreeHook {
+	cfg, err := LoadWorktreeHookConfig(repoDir)
+	if err != nil || cfg == nil {
+		return nil
+	}
+
+	var hooks []WorktreeHook
+	for name, hook := range cfg.Hooks {
+		if strings.HasPrefix(name, "ON_CREATE") {
+			hooks = append(hooks, hook)
+		}
+	}
+	return hooks
 }
 
 // GetDeleteHooks loads config.json and returns ON_DELETE hooks partitioned into

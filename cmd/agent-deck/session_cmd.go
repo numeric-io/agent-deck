@@ -493,8 +493,10 @@ func handleSessionFork(profile string, args []string) {
 			out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		if err := git.RunPostWorktreeHook(repoRoot, worktreePath, wtBranch); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+		for _, hook := range git.GetCreateHooks(repoRoot) {
+			if err := git.RunWorktreeHook(repoRoot, worktreePath, wtBranch, hook); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: worktree create hook %s failed: %v\n", hook.File, err)
+			}
 		}
 
 		userConfig, _ := session.LoadUserConfig()
@@ -532,7 +534,11 @@ func handleSessionFork(profile string, args []string) {
 	// Rebuild group tree and ensure group exists
 	groupTree := session.NewGroupTreeWithGroups(instances, groupsData)
 	if forkedInst.GroupPath != "" {
-		groupTree.CreateGroup(forkedInst.GroupPath)
+		if _, exists := groupTree.Groups[forkedInst.GroupPath]; !exists {
+			newGroup := groupTree.CreateGroup(forkedInst.GroupPath)
+			forkedInst.GroupPath = newGroup.Path
+			forkedInst.GroupDisplayName = newGroup.Name
+		}
 	}
 
 	// Save
@@ -689,6 +695,7 @@ func handleSessionShow(profile string, args []string) {
 		"status":              StatusString(inst.Status),
 		"path":                inst.ProjectPath,
 		"group":               inst.GroupPath,
+		"group_name":          inst.GroupDisplayName,
 		"parent_session_id":   inst.ParentSessionID,
 		"parent_project_path": inst.ParentProjectPath,
 		"tool":                inst.Tool,
@@ -726,7 +733,11 @@ func handleSessionShow(profile string, args []string) {
 	sb.WriteString(fmt.Sprintf("Path:    %s\n", FormatPath(inst.ProjectPath)))
 
 	if inst.GroupPath != "" {
-		sb.WriteString(fmt.Sprintf("Group:   %s\n", inst.GroupPath))
+		groupDisplay := inst.GroupDisplayName
+		if groupDisplay == "" {
+			groupDisplay = inst.GroupPath
+		}
+		sb.WriteString(fmt.Sprintf("Group:   %s\n", groupDisplay))
 	}
 
 	sb.WriteString(fmt.Sprintf("Tool:    %s\n", inst.Tool))

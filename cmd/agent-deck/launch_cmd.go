@@ -193,8 +193,10 @@ func handleLaunch(profile string, args []string) {
 			out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		if err := git.RunPostWorktreeHook(repoRoot, worktreePath, wtBranch); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+		for _, hook := range git.GetCreateHooks(repoRoot) {
+			if err := git.RunWorktreeHook(repoRoot, worktreePath, wtBranch, hook); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: worktree create hook %s failed: %v\n", hook.File, err)
+			}
 		}
 
 		worktreeRepoRoot = repoRoot
@@ -296,7 +298,11 @@ func handleLaunch(profile string, args []string) {
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 	if newInstance.GroupPath != "" {
-		groupTree.CreateGroup(newInstance.GroupPath)
+		if _, exists := groupTree.Groups[newInstance.GroupPath]; !exists {
+			newGroup := groupTree.CreateGroup(newInstance.GroupPath)
+			newInstance.GroupPath = newGroup.Path
+			newInstance.GroupDisplayName = newGroup.Name
+		}
 	}
 
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {

@@ -1,6 +1,8 @@
 package session
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"sort"
@@ -9,6 +11,15 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 )
+
+// generateGroupID creates a short random hex ID for group paths.
+func generateGroupID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return hex.EncodeToString([]byte{0, 0, 0, 0})
+	}
+	return "g-" + hex.EncodeToString(b)
+}
 
 // DefaultGroupName is the display name for the default group where ungrouped sessions go
 const DefaultGroupName = "No Group"
@@ -52,6 +63,13 @@ type Group struct {
 	Sessions    []*Instance
 	Order       int
 	DefaultPath string // Explicit default path for new sessions in this group
+}
+
+// setGroupDisplayNames populates GroupDisplayName on all sessions in a group.
+func setGroupDisplayNames(group *Group) {
+	for _, sess := range group.Sessions {
+		sess.GroupDisplayName = group.Name
+	}
 }
 
 // GroupTree manages hierarchical session organization
@@ -101,6 +119,7 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 		sort.SliceStable(group.Sessions, func(i, j int) bool {
 			return group.Sessions[i].Order < group.Sessions[j].Order
 		})
+		setGroupDisplayNames(group)
 	}
 
 	// Sort groups alphabetically and assign order
@@ -169,6 +188,7 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 		sort.SliceStable(group.Sessions, func(i, j int) bool {
 			return group.Sessions[i].Order < group.Sessions[j].Order
 		})
+		setGroupDisplayNames(group)
 	}
 
 	// Rebuild group list maintaining stored order
@@ -617,6 +637,7 @@ func (t *GroupTree) MoveSessionToGroup(inst *Instance, newGroupPath string) {
 		t.rebuildGroupList()
 	}
 	inst.Order = len(newGroup.Sessions)
+	inst.GroupDisplayName = newGroup.Name
 	newGroup.Sessions = append(newGroup.Sessions, inst)
 
 	// Update default paths for both old and new groups
@@ -663,9 +684,19 @@ func sanitizeGroupName(name string) string {
 func (t *GroupTree) CreateGroup(name string) *Group {
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(name)
-	path := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
-	if _, exists := t.Groups[path]; exists {
-		return t.Groups[path]
+
+	// Check if a group with this name already exists (case-insensitive)
+	for _, g := range t.Groups {
+		if strings.EqualFold(g.Name, sanitizedName) {
+			return g
+		}
+	}
+
+	// Generate a stable random ID for the path
+	path := generateGroupID()
+	// Ensure uniqueness (extremely unlikely collision)
+	for _, exists := t.Groups[path]; exists; _, exists = t.Groups[path] {
+		path = generateGroupID()
 	}
 
 	// Count existing root-level groups to assign sibling-relative order
@@ -693,11 +724,21 @@ func (t *GroupTree) CreateGroup(name string) *Group {
 func (t *GroupTree) CreateSubgroup(parentPath, name string) *Group {
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(name)
-	childPath := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
-	fullPath := parentPath + "/" + childPath
 
-	if _, exists := t.Groups[fullPath]; exists {
-		return t.Groups[fullPath]
+	// Check if a subgroup with this name already exists under the parent
+	for p, g := range t.Groups {
+		if getParentPath(p) == parentPath && strings.EqualFold(g.Name, sanitizedName) {
+			return g
+		}
+	}
+
+	// Generate a stable random ID for the child path segment
+	childID := generateGroupID()
+	fullPath := parentPath + "/" + childID
+	// Ensure uniqueness
+	for _, exists := t.Groups[fullPath]; exists; _, exists = t.Groups[fullPath] {
+		childID = generateGroupID()
+		fullPath = parentPath + "/" + childID
 	}
 
 	// Count existing siblings to assign sibling-relative order
@@ -721,70 +762,16 @@ func (t *GroupTree) CreateSubgroup(parentPath, name string) *Group {
 	return group
 }
 
-// RenameGroup renames a group and updates all subgroups
-func (t *GroupTree) RenameGroup(oldPath, newName string) {
-	group, exists := t.Groups[oldPath]
+// RenameGroup renames a group's display name without changing its path.
+// The path is a stable identifier that doesn't change on rename.
+func (t *GroupTree) RenameGroup(path, newName string) {
+	group, exists := t.Groups[path]
 	if !exists {
 		return
 	}
 
 	// Sanitize name to prevent path traversal and security issues
-	sanitizedName := sanitizeGroupName(newName)
-	newBasePath := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
-
-	// Preserve parent path for subgroups
-	parentPath := getParentPath(oldPath)
-	var newPath string
-	if parentPath != "" {
-		newPath = parentPath + "/" + newBasePath
-	} else {
-		newPath = newBasePath
-	}
-
-	if newPath == oldPath {
-		group.Name = sanitizedName
-		return
-	}
-
-	// Update all sessions in the group
-	for _, sess := range group.Sessions {
-		sess.GroupPath = newPath
-	}
-
-	// Update all subgroups (groups whose path starts with oldPath + "/")
-	subgroupsToUpdate := make(map[string]*Group)
-	for path, g := range t.Groups {
-		if strings.HasPrefix(path, oldPath+"/") {
-			newSubPath := newPath + path[len(oldPath):] // Replace prefix
-			// Update sessions in subgroup
-			for _, sess := range g.Sessions {
-				sess.GroupPath = newSubPath
-			}
-			g.Path = newSubPath
-			subgroupsToUpdate[path] = g
-		}
-	}
-
-	// Remove old subgroup entries and add with new paths
-	for oldSubPath, g := range subgroupsToUpdate {
-		delete(t.Groups, oldSubPath)
-		t.Groups[g.Path] = g
-		expanded := t.Expanded[oldSubPath]
-		delete(t.Expanded, oldSubPath)
-		t.Expanded[g.Path] = expanded
-	}
-
-	// Update the main group
-	group.Name = sanitizedName
-	group.Path = newPath
-
-	// Update maps for main group
-	delete(t.Groups, oldPath)
-	t.Groups[newPath] = group
-	delete(t.Expanded, oldPath)
-	t.Expanded[newPath] = group.Expanded
-
-	t.rebuildGroupList()
+	group.Name = sanitizeGroupName(newName)
 }
 
 // DeleteGroup deletes a group, all its subgroups, and moves all sessions to default
@@ -917,6 +904,7 @@ func (t *GroupTree) AddSession(inst *Instance) {
 		t.rebuildGroupList()
 	}
 	inst.Order = len(group.Sessions)
+	inst.GroupDisplayName = group.Name
 	group.Sessions = append(group.Sessions, inst)
 	t.updateGroupDefaultPath(groupPath)
 }
@@ -993,6 +981,7 @@ func (t *GroupTree) SyncWithInstances(instances []*Instance) {
 		sort.SliceStable(group.Sessions, func(i, j int) bool {
 			return group.Sessions[i].Order < group.Sessions[j].Order
 		})
+		setGroupDisplayNames(group)
 	}
 
 	// Always rebuild GroupList at the end to ensure consistency between

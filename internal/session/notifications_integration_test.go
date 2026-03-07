@@ -56,7 +56,7 @@ func TestIntegration_NotificationBarFlow(t *testing.T) {
 
 	// === PHASE 1: Initial sync - all waiting sessions should appear ===
 	t.Log("Phase 1: Initial sync")
-	added, _ := nm.SyncFromInstances(instances, "")
+	added, _ := nm.SyncFromInstances(instances, "", false)
 
 	assert.Len(t, added, 3, "All 3 sessions should be added")
 	assert.Equal(t, 3, nm.Count())
@@ -87,7 +87,7 @@ func TestIntegration_NotificationBarFlow(t *testing.T) {
 	}
 
 	// Sync again
-	_, removed := nm.SyncFromInstances(instances, "")
+	_, removed := nm.SyncFromInstances(instances, "", false)
 
 	assert.Contains(t, removed, "test-session-3", "Acknowledged session should be removed")
 	assert.Equal(t, 2, nm.Count())
@@ -106,7 +106,7 @@ func TestIntegration_NotificationBarFlow(t *testing.T) {
 	t.Log("Phase 3: Current session exclusion")
 
 	// Simulate: we're currently in test-session-2
-	nm.SyncFromInstances(instances, "test-session-2")
+	nm.SyncFromInstances(instances, "test-session-2", false)
 
 	// test-session-2 should NOT be in the bar (we're in it)
 	assert.False(t, nm.Has("test-session-2"), "Current session should not appear in notification bar")
@@ -130,7 +130,7 @@ func TestIntegration_NotificationBarFlow(t *testing.T) {
 	}
 
 	nm2 := NewNotificationManager(6, false, false)
-	nm2.SyncFromInstances(manyInstances, "")
+	nm2.SyncFromInstances(manyInstances, "", false)
 
 	assert.Equal(t, 6, nm2.Count(), "Should limit to 6 sessions")
 
@@ -217,7 +217,7 @@ func TestIntegration_CtrlB1RemovesFromBar(t *testing.T) {
 
 	// === STATE 1: User is in session-current ===
 	// Sync excludes current session
-	nm.SyncFromInstances(instances, "session-current")
+	nm.SyncFromInstances(instances, "session-current", false)
 
 	// Bar should show: [1] third-work [2] other-work (session-current excluded)
 	t.Logf("Before Ctrl+b 1: %s", nm.FormatBar())
@@ -246,7 +246,7 @@ func TestIntegration_CtrlB1RemovesFromBar(t *testing.T) {
 	sessionTarget.Status = StatusIdle
 
 	// Sync with session-target as current (user is now in session-target)
-	nm.SyncFromInstances(instances, "session-target")
+	nm.SyncFromInstances(instances, "session-target", false)
 
 	// === VERIFY: session-target is NOT in bar ===
 	t.Logf("After Ctrl+b %s: %s", targetKey, nm.FormatBar())
@@ -281,7 +281,7 @@ func TestIntegration_SwitchBackAndForth(t *testing.T) {
 
 	// === User starts in session A ===
 	t.Log("User is in Session-A")
-	nm.SyncFromInstances(instances, "a")
+	nm.SyncFromInstances(instances, "a", false)
 	t.Logf("Bar: %s", nm.FormatBar())
 	assert.Equal(t, 2, nm.Count()) // B and C shown
 	assert.False(t, nm.Has("a"))
@@ -291,7 +291,7 @@ func TestIntegration_SwitchBackAndForth(t *testing.T) {
 	// === User switches to session B (Ctrl+b to B) ===
 	t.Log("User switches to Session-B")
 	sessionB.Status = StatusIdle // Acknowledged
-	nm.SyncFromInstances(instances, "b")
+	nm.SyncFromInstances(instances, "b", false)
 	t.Logf("Bar: %s", nm.FormatBar())
 	assert.Equal(t, 2, nm.Count()) // A and C shown
 	assert.True(t, nm.Has("a"))    // A is now waiting again (user left it)
@@ -301,7 +301,7 @@ func TestIntegration_SwitchBackAndForth(t *testing.T) {
 	// === User switches to session C (Ctrl+b to C) ===
 	t.Log("User switches to Session-C")
 	sessionC.Status = StatusIdle // Acknowledged
-	nm.SyncFromInstances(instances, "c")
+	nm.SyncFromInstances(instances, "c", false)
 	t.Logf("Bar: %s", nm.FormatBar())
 	assert.Equal(t, 1, nm.Count()) // Only A shown (B and C are idle)
 	assert.True(t, nm.Has("a"))
@@ -314,7 +314,7 @@ func TestIntegration_SwitchBackAndForth(t *testing.T) {
 	// === Session B starts new work, becomes waiting again ===
 	t.Log("Session-B has new work (becomes waiting)")
 	sessionB.Status = StatusWaiting
-	nm.SyncFromInstances(instances, "c")
+	nm.SyncFromInstances(instances, "c", false)
 	t.Logf("Bar: %s", nm.FormatBar())
 	assert.Equal(t, 2, nm.Count()) // A and B shown
 	assert.True(t, nm.Has("a"))

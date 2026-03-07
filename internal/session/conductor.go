@@ -1127,6 +1127,15 @@ func LaunchdPlistPath() (string, error) {
 // Prefer the current PATH (so pyenv/asdf-selected interpreters win),
 // then fall back to common absolute locations for non-interactive environments.
 func findPython3() string {
+	// Prefer the conductor venv if it exists (has all bridge dependencies).
+	condDir, err := ConductorDir()
+	if err == nil {
+		venvPython := filepath.Join(condDir, ".venv", "bin", "python3")
+		if _, err := os.Stat(venvPython); err == nil {
+			return venvPython
+		}
+	}
+
 	// Respect the user's current shell environment first.
 	if p, err := exec.LookPath("python3"); err == nil {
 		if abs, absErr := filepath.Abs(p); absErr == nil {

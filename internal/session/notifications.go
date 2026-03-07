@@ -72,7 +72,7 @@ func (nm *NotificationManager) Add(inst *Instance) error {
 		TmuxName:     tmuxName,
 		Title:        inst.Title,
 		Tool:         inst.GetToolThreadSafe(),
-		GroupName:    extractGroupName(inst.GroupPath),
+		GroupName:    inst.GroupDisplayName,
 		WaitingSince: time.Now(),
 	}
 
@@ -187,7 +187,7 @@ func (nm *NotificationManager) FormatBar() string {
 		)
 		// Show group/title tool, like a filesystem path
 		displayName := e.Title
-		if e.GroupName != "" && e.GroupName != DefaultGroupPath {
+		if e.GroupName != "" && e.GroupName != DefaultGroupName {
 			displayName = e.GroupName + "/" + e.Title
 		}
 		if e.Tool != "" && e.Tool != "shell" {
@@ -304,7 +304,7 @@ func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentS
 			e.Status = inst.GetStatusThreadSafe()
 			e.Title = inst.Title
 			e.Tool = inst.GetToolThreadSafe()
-			e.GroupName = extractGroupName(inst.GroupPath)
+			e.GroupName = inst.GroupDisplayName
 			if ts := inst.GetTmuxSession(); ts != nil {
 				e.TmuxName = ts.Name
 			}
@@ -327,7 +327,7 @@ func (nm *NotificationManager) SyncFromInstances(instances []*Instance, currentS
 			TmuxName:     tmuxName,
 			Title:        inst.Title,
 			Tool:         inst.GetToolThreadSafe(),
-			GroupName:    extractGroupName(inst.GroupPath),
+			GroupName:    inst.GroupDisplayName,
 			WaitingSince: inst.GetWaitingSince(),
 			Status:       inst.GetStatusThreadSafe(),
 		}

@@ -959,8 +959,10 @@ func handleAdd(profile string, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
 			os.Exit(1)
 		}
-		if err := git.RunPostWorktreeHook(repoRoot, worktreePath, wtBranch); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: post-worktree hook failed: %v\n", err)
+		for _, hook := range git.GetCreateHooks(repoRoot) {
+			if err := git.RunWorktreeHook(repoRoot, worktreePath, wtBranch, hook); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: worktree create hook %s failed: %v\n", hook.File, err)
+			}
 		}
 
 		fmt.Printf("Created worktree at: %s\n", worktreePath)
@@ -1060,9 +1062,15 @@ func handleAdd(profile string, args []string) {
 
 	// Rebuild group tree and save
 	groupTree = session.NewGroupTreeWithGroups(instances, groups)
-	// Ensure the session's group exists
+	// Ensure the session's group exists; if not, create it using the path as a display name
 	if newInstance.GroupPath != "" {
-		groupTree.CreateGroup(newInstance.GroupPath)
+		if _, exists := groupTree.Groups[newInstance.GroupPath]; !exists {
+			// The GroupPath is a user-provided name that didn't match any existing group.
+			// Create a new group with this as its display name (gets a random ID path).
+			newGroup := groupTree.CreateGroup(newInstance.GroupPath)
+			newInstance.GroupPath = newGroup.Path
+			newInstance.GroupDisplayName = newGroup.Name
+		}
 	}
 
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
@@ -1100,7 +1108,11 @@ func handleAdd(profile string, args []string) {
 	humanLines = append(humanLines, fmt.Sprintf("Added session: %s", sessionTitle))
 	humanLines = append(humanLines, fmt.Sprintf("  Profile: %s", storage.Profile()))
 	humanLines = append(humanLines, fmt.Sprintf("  Path:    %s", path))
-	humanLines = append(humanLines, fmt.Sprintf("  Group:   %s", newInstance.GroupPath))
+	groupDisplay := newInstance.GroupDisplayName
+	if groupDisplay == "" {
+		groupDisplay = newInstance.GroupPath
+	}
+	humanLines = append(humanLines, fmt.Sprintf("  Group:   %s", groupDisplay))
 	humanLines = append(humanLines, fmt.Sprintf("  ID:      %s", newInstance.ID))
 	if sessionCommandInput != "" {
 		humanLines = append(humanLines, fmt.Sprintf("  Cmd:     %s", sessionCommandInput))
@@ -1142,7 +1154,8 @@ func handleAdd(profile string, args []string) {
 		"title":   newInstance.Title,
 		"path":    path,
 		"tool":    newInstance.Tool,
-		"group":   newInstance.GroupPath,
+		"group":      newInstance.GroupPath,
+		"group_name": newInstance.GroupDisplayName,
 		"profile": storage.Profile(),
 	}
 	if sessionCommandInput != "" {
@@ -1242,6 +1255,7 @@ func handleList(profile string, args []string) {
 			Title         string    `json:"title"`
 			Path          string    `json:"path"`
 			Group         string    `json:"group"`
+			GroupName     string    `json:"group_name,omitempty"`
 			Tool          string    `json:"tool"`
 			Command       string    `json:"command,omitempty"`
 			Status        string    `json:"status"`
@@ -1258,6 +1272,7 @@ func handleList(profile string, args []string) {
 				Title:         inst.Title,
 				Path:          inst.ProjectPath,
 				Group:         inst.GroupPath,
+				GroupName:     inst.GroupDisplayName,
 				Tool:          inst.Tool,
 				Command:       inst.Command,
 				Status:        StatusString(inst.Status),
@@ -1282,7 +1297,11 @@ func handleList(profile string, args []string) {
 	fmt.Println(strings.Repeat("-", tableColTitle+tableColGroup+tableColPath+tableColIDDisplay+5))
 	for _, inst := range instances {
 		title := truncate(inst.Title, tableColTitle)
-		group := truncate(inst.GroupPath, tableColGroup)
+		groupName := inst.GroupDisplayName
+		if groupName == "" {
+			groupName = inst.GroupPath
+		}
+		group := truncate(groupName, tableColGroup)
 		path := truncate(inst.ProjectPath, tableColPath)
 		// Safe ID display with bounds check to prevent panic
 		idDisplay := inst.ID
@@ -1316,6 +1335,7 @@ func handleListAllProfiles(jsonOutput bool) {
 			Title         string    `json:"title"`
 			Path          string    `json:"path"`
 			Group         string    `json:"group"`
+			GroupName     string    `json:"group_name,omitempty"`
 			Tool          string    `json:"tool"`
 			Command       string    `json:"command,omitempty"`
 			Profile       string    `json:"profile"`
@@ -1340,6 +1360,7 @@ func handleListAllProfiles(jsonOutput bool) {
 					Title:         inst.Title,
 					Path:          inst.ProjectPath,
 					Group:         inst.GroupPath,
+					GroupName:     inst.GroupDisplayName,
 					Tool:          inst.Tool,
 					Command:       inst.Command,
 					Profile:       profileName,
@@ -1381,7 +1402,11 @@ func handleListAllProfiles(jsonOutput bool) {
 
 		for _, inst := range instances {
 			title := truncate(inst.Title, tableColTitle)
-			group := truncate(inst.GroupPath, tableColGroup)
+			groupName := inst.GroupDisplayName
+			if groupName == "" {
+				groupName = inst.GroupPath
+			}
+			group := truncate(groupName, tableColGroup)
 			path := truncate(inst.ProjectPath, tableColPath)
 			idDisplay := inst.ID
 			if len(idDisplay) > tableColIDDisplay {

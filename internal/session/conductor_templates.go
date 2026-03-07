@@ -379,11 +379,13 @@ Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import re
+import signal
 import subprocess
 import sys
-import time
+import traceback
 from pathlib import Path
 
 import toml
@@ -435,19 +437,39 @@ DISCORD_MAX_LENGTH = 2000
 # How long to wait for conductor to respond (seconds)
 RESPONSE_TIMEOUT = 300
 
+# CLI retry settings
+CLI_MAX_RETRIES = 2
+CLI_RETRY_BACKOFF = 2  # seconds, doubled each retry
+
+# Slack send retry settings
+SLACK_SEND_MAX_RETRIES = 3
+SLACK_SEND_RETRY_BACKOFF = 1
+
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (with rotation)
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+CONDUCTOR_DIR.mkdir(parents=True, exist_ok=True)
+
 log = logging.getLogger("conductor-bridge")
+log.setLevel(logging.INFO)
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+)
+log.addHandler(_file_handler)
+
+# Only add stdout handler if not running under launchd/systemd
+# (they redirect stdout to the same log file, causing duplicates)
+if not os.environ.get("LAUNCHED_BY_LAUNCHD") and sys.stdout.isatty():
+    _stdout_handler = logging.StreamHandler(sys.stdout)
+    _stdout_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    log.addHandler(_stdout_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -603,23 +625,85 @@ def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def run_cli(
-    *args: str, profile: str | None = None, timeout: int = 120
+async def run_cli(
+    *args: str, profile: str | None = None, timeout: int = 120,
+    retries: int = 0,
 ) -> subprocess.CompletedProcess:
-    """Run an agent-deck CLI command and return the result.
+    """Run an agent-deck CLI command asynchronously with retries.
 
     If profile is provided, prepends -p <profile> to the command.
+    Retries transient failures with exponential backoff.
     """
     cmd = ["agent-deck"]
     if profile:
         cmd += ["-p", profile]
     cmd += list(args)
-    log.debug("CLI: %s", " ".join(cmd))
+    cmd_str = " ".join(cmd)
+
+    max_attempts = 1 + retries
+    last_result = None
+
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            delay = CLI_RETRY_BACKOFF * (2 ** (attempt - 1))
+            log.info("CLI retry %d/%d after %.1fs: %s", attempt, retries, delay, cmd_str)
+            await asyncio.sleep(delay)
+
+        log.debug("CLI: %s", cmd_str)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                log.warning("CLI timeout (%ds): %s", timeout, cmd_str)
+                last_result = subprocess.CompletedProcess(cmd, 1, "", "timeout")
+                continue
+
+            result = subprocess.CompletedProcess(
+                cmd,
+                proc.returncode,
+                stdout_bytes.decode("utf-8", errors="replace"),
+                stderr_bytes.decode("utf-8", errors="replace"),
+            )
+
+            if result.returncode == 0:
+                return result
+
+            last_result = result
+            # Don't retry non-transient errors
+            stderr_lower = result.stderr.lower()
+            if "not found" in stderr_lower or "no such" in stderr_lower:
+                return result
+
+        except FileNotFoundError:
+            log.error("agent-deck not found in PATH")
+            return subprocess.CompletedProcess(cmd, 1, "", "not found")
+        except Exception as e:
+            log.error("CLI unexpected error: %s: %s", cmd_str, e)
+            last_result = subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+    return last_result
+
+
+def run_cli_sync(
+    *args: str, profile: str | None = None, timeout: int = 120
+) -> subprocess.CompletedProcess:
+    """Synchronous fallback for run_cli (used in blocking contexts like pre-start)."""
+    cmd = ["agent-deck"]
+    if profile:
+        cmd += ["-p", profile]
+    cmd += list(args)
+    log.debug("CLI (sync): %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        )
-        return result
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         log.warning("CLI timeout: %s", " ".join(cmd))
         return subprocess.CompletedProcess(cmd, 1, "", "timeout")
@@ -628,9 +712,9 @@ def run_cli(
         return subprocess.CompletedProcess(cmd, 1, "", "not found")
 
 
-def get_session_status(session: str, profile: str | None = None) -> str:
+async def get_session_status(session: str, profile: str | None = None) -> str:
     """Get the status of a session (running/waiting/idle/error)."""
-    result = run_cli(
+    result = await run_cli(
         "session", "show", "--json", session, profile=profile, timeout=30
     )
     if result.returncode != 0:
@@ -642,9 +726,9 @@ def get_session_status(session: str, profile: str | None = None) -> str:
         return "error"
 
 
-def get_session_output(session: str, profile: str | None = None) -> str:
+async def get_session_output(session: str, profile: str | None = None) -> str:
     """Get the last response from a session."""
-    result = run_cli(
+    result = await run_cli(
         "session", "output", session, "-q", profile=profile, timeout=30
     )
     if result.returncode != 0:
@@ -652,7 +736,7 @@ def get_session_output(session: str, profile: str | None = None) -> str:
     return result.stdout.strip()
 
 
-def send_to_conductor(
+async def send_to_conductor(
     session: str,
     message: str,
     profile: str | None = None,
@@ -664,30 +748,31 @@ def send_to_conductor(
     Returns (success, response_text). When wait_for_reply=False, response_text is "".
     """
     if wait_for_reply:
-        # Single-call flow: send + wait + print raw response.
-        # Avoids extra status/output polling round-trips.
-        result = run_cli(
+        result = await run_cli(
             "session", "send", session, message,
             "--wait", "--timeout", f"{response_timeout}s", "-q",
             profile=profile,
             timeout=max(response_timeout+30, 60),
+            retries=1,
         )
     else:
-        result = run_cli(
+        result = await run_cli(
             "session", "send", session, message, "--no-wait",
             profile=profile, timeout=30,
+            retries=CLI_MAX_RETRIES,
         )
     if result.returncode != 0:
         log.error(
-            "Failed to send to conductor: %s", result.stderr.strip()
+            "Failed to send to conductor [%s]: %s",
+            profile or "default", result.stderr.strip(),
         )
         return False, ""
     return True, result.stdout.strip()
 
 
-def get_status_summary(profile: str | None = None) -> dict:
+async def get_status_summary(profile: str | None = None) -> dict:
     """Get agent-deck status as a dict for a single profile."""
-    result = run_cli("status", "--json", profile=profile, timeout=30)
+    result = await run_cli("status", "--json", profile=profile, timeout=30)
     if result.returncode != 0:
         return {"waiting": 0, "running": 0, "idle": 0, "error": 0, "total": 0}
     try:
@@ -696,26 +781,26 @@ def get_status_summary(profile: str | None = None) -> dict:
         return {"waiting": 0, "running": 0, "idle": 0, "error": 0, "total": 0}
 
 
-def get_status_summary_all(profiles: list[str]) -> dict:
-    """Aggregate status across all profiles."""
+async def get_status_summary_all(profiles: list[str]) -> dict:
+    """Aggregate status across all profiles concurrently."""
     totals = {"waiting": 0, "running": 0, "idle": 0, "error": 0, "total": 0}
     per_profile = {}
-    for profile in profiles:
-        summary = get_status_summary(profile)
+    tasks = {p: asyncio.create_task(get_status_summary(p)) for p in profiles}
+    for profile, task in tasks.items():
+        summary = await task
         per_profile[profile] = summary
         for key in totals:
             totals[key] += summary.get(key, 0)
     return {"totals": totals, "per_profile": per_profile}
 
 
-def get_sessions_list(profile: str | None = None) -> list:
+async def get_sessions_list(profile: str | None = None) -> list:
     """Get list of all sessions for a single profile."""
-    result = run_cli("list", "--json", profile=profile, timeout=30)
+    result = await run_cli("list", "--json", profile=profile, timeout=30)
     if result.returncode != 0:
         return []
     try:
         data = json.loads(result.stdout)
-        # list --json returns {"sessions": [...]}
         if isinstance(data, dict):
             return data.get("sessions", [])
         return data if isinstance(data, list) else []
@@ -723,35 +808,34 @@ def get_sessions_list(profile: str | None = None) -> list:
         return []
 
 
-def get_sessions_list_all(profiles: list[str]) -> list[tuple[str, dict]]:
-    """Get sessions from all profiles, each tagged with profile name."""
+async def get_sessions_list_all(profiles: list[str]) -> list[tuple[str, dict]]:
+    """Get sessions from all profiles concurrently, each tagged with profile name."""
+    tasks = {p: asyncio.create_task(get_sessions_list(p)) for p in profiles}
     all_sessions = []
     for profile in profiles:
-        sessions = get_sessions_list(profile)
+        sessions = await tasks[profile]
         for s in sessions:
             all_sessions.append((profile, s))
     return all_sessions
 
 
-def ensure_conductor_running(name: str, profile: str) -> bool:
+async def ensure_conductor_running(name: str, profile: str) -> bool:
     """Ensure the conductor session exists and is running."""
     profile = profile or "default"
     session_title = conductor_session_title(name)
-    status = get_session_status(session_title, profile=profile)
+    status = await get_session_status(session_title, profile=profile)
 
     if status == "error":
         log.info(
             "Conductor %s not running, attempting to start...", name,
         )
-        # Try starting first (session might exist but be stopped)
-        result = run_cli(
+        result = await run_cli(
             "session", "start", session_title, profile=profile, timeout=60
         )
         if result.returncode != 0:
-            # Session might not exist, try creating it
             log.info("Creating conductor session for %s...", name)
             session_path = str(CONDUCTOR_DIR / name)
-            result = run_cli(
+            result = await run_cli(
                 "add", session_path,
                 "-t", session_title,
                 "-c", "claude",
@@ -766,16 +850,14 @@ def ensure_conductor_running(name: str, profile: str) -> bool:
                     result.stderr.strip(),
                 )
                 return False
-            # Start the newly created session
-            run_cli(
+            await run_cli(
                 "session", "start", session_title,
                 profile=profile, timeout=60,
             )
 
-        # Wait a moment for the session to initialize
-        time.sleep(5)
+        await asyncio.sleep(5)
         return (
-            get_session_status(session_title, profile=profile) != "error"
+            await get_session_status(session_title, profile=profile) != "error"
         )
 
     return True
@@ -846,14 +928,11 @@ class _QueueItem:
         self.on_response = on_response
 
 
-def _send_with_ensure(conductor_name, session_title, profile, message):
-    """Blocking: ensure conductor is running, then send message.
-
-    Intended to be called via asyncio.to_thread() from the queue worker.
-    """
-    if not ensure_conductor_running(conductor_name, profile):
+async def _send_with_ensure(conductor_name, session_title, profile, message):
+    """Ensure conductor is running, then send message."""
+    if not await ensure_conductor_running(conductor_name, profile):
         return False, f"[Could not start conductor {conductor_name}. Check agent-deck.]"
-    return send_to_conductor(
+    return await send_to_conductor(
         session_title, message, profile=profile,
         wait_for_reply=True, response_timeout=RESPONSE_TIMEOUT,
     )
@@ -865,14 +944,13 @@ async def _conductor_worker(name: str, queue: asyncio.Queue):
     while True:
         item = await queue.get()
         try:
-            ok, response = await asyncio.to_thread(
-                _send_with_ensure,
+            ok, response = await _send_with_ensure(
                 item.conductor_name, item.session_title,
                 item.profile, item.message,
             )
             await item.on_response(ok, response)
         except Exception as e:
-            log.error("Queue worker [%s] error: %s", name, e)
+            log.error("Queue worker [%s] error: %s\n%s", name, e, traceback.format_exc())
             try:
                 await item.on_response(False, f"[Internal error: {e}]")
             except Exception:
@@ -964,7 +1042,7 @@ def create_telegram_bot(config: dict):
         if not is_authorized(message):
             return
         profiles = get_unique_profiles()
-        agg = get_status_summary_all(profiles)
+        agg = await get_status_summary_all(profiles)
         totals = agg["totals"]
 
         lines = [
@@ -992,7 +1070,7 @@ def create_telegram_bot(config: dict):
         if not is_authorized(message):
             return
         profiles = get_unique_profiles()
-        all_sessions = get_sessions_list_all(profiles)
+        all_sessions = await get_sessions_list_all(profiles)
         if not all_sessions:
             await message.answer("No sessions found.")
             return
@@ -1058,7 +1136,7 @@ def create_telegram_bot(config: dict):
         await message.answer(
             f"Restarting conductor {target['name']}..."
         )
-        result = run_cli(
+        result = await run_cli(
             "session", "restart", session_title,
             profile=target["profile"], timeout=60,
         )
@@ -1207,11 +1285,22 @@ def create_slack_app(config: dict):
         return conductors[0] if conductors else None
 
     async def _safe_say(say, **kwargs):
-        """Wrapper around say() that catches network/API errors."""
-        try:
-            await say(**kwargs)
-        except Exception as e:
-            log.error("Slack say() failed: %s", e)
+        """Wrapper around say() with retries on transient failure."""
+        for attempt in range(SLACK_SEND_MAX_RETRIES):
+            try:
+                await say(**kwargs)
+                return True
+            except Exception as e:
+                if attempt < SLACK_SEND_MAX_RETRIES - 1:
+                    delay = SLACK_SEND_RETRY_BACKOFF * (2 ** attempt)
+                    log.warning(
+                        "Slack say() failed (attempt %d/%d), retrying in %.1fs: %s",
+                        attempt + 1, SLACK_SEND_MAX_RETRIES, delay, e,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    log.error("Slack say() failed after %d attempts: %s", SLACK_SEND_MAX_RETRIES, e)
+                    return False
 
     async def _handle_slack_text(text: str, say, thread_ts: str = None):
         """Dispatch Slack message to a background task immediately.
@@ -1284,26 +1373,43 @@ def create_slack_app(config: dict):
 
         Only active when listen_mode is "all". Ignored in "mentions" mode.
         """
+        subtype = event.get("subtype")
+        has_bot_id = bool(event.get("bot_id"))
+        evt_channel = event.get("channel", "")
+        evt_user = event.get("user", "")
+        evt_thread = event.get("thread_ts")
+        evt_text = (event.get("text") or "")[:80]
+
+        log.debug(
+            "Slack event: ch=%s user=%s subtype=%s bot_id=%s thread=%s text=%s",
+            evt_channel, evt_user, subtype, has_bot_id,
+            evt_thread or "none", evt_text,
+        )
+
         if listen_mode != "all":
             return
         # Ignore bot messages
-        if event.get("bot_id") or event.get("subtype"):
+        if has_bot_id or subtype:
             return
         # Only listen in configured channel
-        if event.get("channel") != channel_id:
+        if evt_channel != channel_id:
             return
 
         # Authorization check
-        user_id = event.get("user", "")
-        if not is_slack_authorized(user_id):
+        if not is_slack_authorized(evt_user):
             return
 
         text = event.get("text", "").strip()
         if not text:
             return
+
+        log.info(
+            "Slack message -> channel=%s user=%s thread=%s text=%s",
+            evt_channel, evt_user, evt_thread or "top-level", text[:100],
+        )
         await _handle_slack_text(
             text, say,
-            thread_ts=event.get("thread_ts") or event.get("ts"),
+            thread_ts=evt_thread or event.get("ts"),
         )
 
     @app.event("app_mention")
@@ -1338,7 +1444,7 @@ def create_slack_app(config: dict):
             return
 
         profiles = get_unique_profiles()
-        agg = get_status_summary_all(profiles)
+        agg = await get_status_summary_all(profiles)
         totals = agg["totals"]
 
         lines = [
@@ -1372,7 +1478,7 @@ def create_slack_app(config: dict):
             return
 
         profiles = get_unique_profiles()
-        all_sessions = get_sessions_list_all(profiles)
+        all_sessions = await get_sessions_list_all(profiles)
         if not all_sessions:
             await respond("No sessions found.")
             return
@@ -1416,7 +1522,7 @@ def create_slack_app(config: dict):
 
         session_title = conductor_session_title(target["name"])
         await respond(f"Restarting conductor {target['name']}...")
-        result = run_cli(
+        result = await run_cli(
             "session", "restart", session_title,
             profile=target["profile"], timeout=60,
         )
@@ -1532,7 +1638,7 @@ def create_discord_bot(config: dict):
             return
 
         profiles = get_unique_profiles()
-        agg = get_status_summary_all(profiles)
+        agg = await get_status_summary_all(profiles)
         totals = agg["totals"]
 
         lines = [
@@ -1569,7 +1675,7 @@ def create_discord_bot(config: dict):
             return
 
         profiles = get_unique_profiles()
-        all_sessions = get_sessions_list_all(profiles)
+        all_sessions = await get_sessions_list_all(profiles)
         if not all_sessions:
             await interaction.response.send_message("No sessions found.")
             return
@@ -1632,7 +1738,7 @@ def create_discord_bot(config: dict):
             f"Restarting conductor {target['name']}...",
         )
 
-        result = run_cli(
+        result = await run_cli(
             "session", "restart", session_title,
             profile=target["profile"], timeout=60,
         )
@@ -1721,7 +1827,7 @@ def create_discord_bot(config: dict):
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
 
-        if not ensure_conductor_running(target["name"], profile):
+        if not await ensure_conductor_running(target["name"], profile):
             await message.channel.send(
                 f"[Could not start conductor {target['name']}. Check agent-deck.]",
             )
@@ -1731,7 +1837,7 @@ def create_discord_bot(config: dict):
             "Discord message -> [%s]: %s",
             target["name"], cleaned_msg[:100],
         )
-        ok, response = send_to_conductor(
+        ok, response = await send_to_conductor(
             session_title,
             cleaned_msg,
             profile=profile,
@@ -1782,12 +1888,14 @@ async def heartbeat_loop(
     tg_user_id = config["telegram"]["user_id"] if config["telegram"]["configured"] else None
 
     log.info("Heartbeat loop started (global interval: %d minutes)", global_interval)
+    consecutive_full_failures = 0
 
     while True:
         await asyncio.sleep(interval_seconds)
 
         all_conductors = discover_conductors()
         conductors = select_heartbeat_conductors(all_conductors)
+        any_success = False
         for conductor in conductors:
             try:
                 name = conductor.get("name", "")
@@ -1798,7 +1906,7 @@ async def heartbeat_loop(
                 session_title = conductor_session_title(name)
 
                 # Get current status for this conductor's profile
-                summary = get_status_summary(profile)
+                summary = await get_status_summary(profile)
                 waiting = summary.get("waiting", 0)
                 running = summary.get("running", 0)
                 idle = summary.get("idle", 0)
@@ -1809,12 +1917,14 @@ async def heartbeat_loop(
                     name, profile, waiting, running, idle, error,
                 )
 
+                any_success = True
+
                 # Only trigger conductor if there are waiting or error sessions
                 if waiting == 0 and error == 0:
                     continue
 
                 # Build heartbeat message with waiting session details
-                sessions = get_sessions_list(profile)
+                sessions = await get_sessions_list(profile)
                 waiting_details = []
                 error_details = []
                 for s in sessions:
@@ -1928,7 +2038,29 @@ async def heartbeat_loop(
                             )
 
             except Exception as e:
-                log.error("Heartbeat [%s] error: %s", conductor.get("name", "?"), e)
+                log.error(
+                    "Heartbeat [%s] error: %s\n%s",
+                    conductor.get("name", "?"), e, traceback.format_exc(),
+                )
+
+        if any_success:
+            consecutive_full_failures = 0
+        else:
+            consecutive_full_failures += 1
+            if consecutive_full_failures >= 3:
+                log.error(
+                    "Heartbeat: %d consecutive full failures",
+                    consecutive_full_failures,
+                )
+                if slack_app and slack_channel_id:
+                    try:
+                        await slack_app.client.chat_postMessage(
+                            channel=slack_channel_id,
+                            text=f":warning: Bridge heartbeat failing for all conductors "
+                            f"({consecutive_full_failures} cycles). Check agent-deck.",
+                        )
+                    except Exception:
+                        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1937,6 +2069,10 @@ async def heartbeat_loop(
 
 
 async def main():
+    log.info("=" * 60)
+    log.info("Conductor bridge starting")
+    log.info("=" * 60)
+
     log.info("Loading config from %s", CONFIG_PATH)
     config = load_config()
 
@@ -1974,6 +2110,13 @@ async def main():
         ", ".join(conductor_names) if conductor_names else "none",
     )
 
+    # Startup health check: verify agent-deck is available
+    cli_check = await run_cli("version", timeout=10)
+    if cli_check.returncode != 0 and "not found" in cli_check.stderr:
+        log.error("Startup check failed: agent-deck not in PATH")
+        sys.exit(1)
+    log.info("Startup check: agent-deck OK")
+
     # Create Telegram bot
     telegram_bot, telegram_dp = None, None
     if tg_ok:
@@ -1989,6 +2132,13 @@ async def main():
         if result:
             slack_app, slack_channel_id = result
             slack_handler = AsyncSocketModeHandler(slack_app, config["slack"]["app_token"])
+            # Verify Slack connectivity
+            try:
+                auth = await slack_app.client.auth_test()
+                log.info("Startup check: Slack bot OK (@%s)", auth.get("user", "?"))
+            except Exception as e:
+                log.error("Startup check failed: Slack API unreachable: %s", e)
+                sys.exit(1)
 
     # Create Discord bot
     discord_bot, discord_channel_id = None, None
@@ -1999,10 +2149,20 @@ async def main():
 
     # Pre-start all conductors so they're warm when messages arrive
     for c in conductors:
-        if ensure_conductor_running(c["name"], c["profile"]):
+        if await ensure_conductor_running(c["name"], c["profile"]):
             log.info("Conductor %s is running", c["name"])
         else:
             log.warning("Failed to pre-start conductor %s", c["name"])
+
+    # Notify via Slack that bridge is starting
+    if slack_app and slack_channel_id:
+        try:
+            await slack_app.client.chat_postMessage(
+                channel=slack_channel_id,
+                text=f"Bridge started. Conductors: {', '.join(conductor_names) if conductor_names else 'none'}",
+            )
+        except Exception as e:
+            log.warning("Could not send startup notification: %s", e)
 
     # Start heartbeat (shared, notifies all platforms)
     heartbeat_task = asyncio.create_task(
@@ -2016,6 +2176,17 @@ async def main():
         )
     )
 
+    # Graceful shutdown on signals
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def handle_signal(sig):
+        log.info("Received signal %s, shutting down...", sig.name)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, handle_signal, sig)
+
     # Run all platforms concurrently
     tasks = [heartbeat_task]
     if telegram_dp and telegram_bot:
@@ -2028,16 +2199,38 @@ async def main():
         tasks.append(asyncio.create_task(discord_bot.start(config["discord"]["bot_token"])))
         log.info("Discord bot started")
 
+    async def shutdown_watcher():
+        await shutdown_event.wait()
+        log.info("Shutdown initiated...")
+        if slack_handler:
+            await slack_handler.close_async()
+        if telegram_dp:
+            await telegram_dp.stop_polling()
+
+    tasks.append(asyncio.create_task(shutdown_watcher()))
+
     try:
         await asyncio.gather(*tasks)
+    except Exception as e:
+        log.error("Bridge crashed: %s\n%s", e, traceback.format_exc())
+        raise
     finally:
+        log.info("Cleaning up...")
         heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
         if telegram_bot:
             await telegram_bot.session.close()
         if slack_handler:
-            await slack_handler.close_async()
+            try:
+                await slack_handler.close_async()
+            except Exception:
+                pass
         if discord_bot:
             await discord_bot.close()
+        log.info("Bridge stopped")
 
 
 if __name__ == "__main__":

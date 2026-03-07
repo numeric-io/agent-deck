@@ -5025,23 +5025,8 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case GroupDialogRename:
 			name := h.groupDialog.GetValue()
 			if name != "" {
-				oldPath := h.groupDialog.GetGroupPath()
-				// Snapshot existing paths so we can detect the new path after rename
-				pathsBefore := make(map[string]bool, len(h.groupTree.Groups))
-				for p := range h.groupTree.Groups {
-					pathsBefore[p] = true
-				}
-				h.groupTree.RenameGroup(oldPath, name)
-				// Find the newly created path and move the notes files
-				for p := range h.groupTree.Groups {
-					if !pathsBefore[p] {
-						session.RenameGroupNotes(h.profile, oldPath, p)
-						break
-					}
-				}
-				h.instancesMu.Lock()
-				h.instances = h.groupTree.GetAllInstances()
-				h.instancesMu.Unlock()
+				path := h.groupDialog.GetGroupPath()
+				h.groupTree.RenameGroup(path, name)
 				h.rebuildFlatItems()
 				h.forceSaveInstances()
 			}
@@ -5505,11 +5490,15 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		}
 		uiLog.Info("session_create_succeeded", slog.String("id", inst.ID))
 
-		// Run post-worktree hook in background so the session appears immediately
+		// Run ON_CREATE hooks in background so the session appears immediately
 		if worktreePath != "" && worktreeRepoRoot != "" && worktreeBranch != "" {
 			go func() {
-				if err := git.RunPostWorktreeHook(worktreeRepoRoot, worktreePath, worktreeBranch); err != nil {
-					uiLog.Warn("post_worktree_hook_failed", slog.String("error", err.Error()))
+				for _, hook := range git.GetCreateHooks(worktreeRepoRoot) {
+					if err := git.RunWorktreeHook(worktreeRepoRoot, worktreePath, worktreeBranch, hook); err != nil {
+						uiLog.Warn("worktree_create_hook_failed",
+							slog.String("hook", hook.File),
+							slog.String("error", err.Error()))
+					}
 				}
 			}()
 		}
@@ -5728,11 +5717,15 @@ func (h *Home) forkSessionCmdWithOptions(
 			go inst.DetectOpenCodeSession()
 		}
 
-		// Run post-worktree hook in background so the session appears immediately
+		// Run ON_CREATE hooks in background so the session appears immediately
 		if opts != nil && opts.WorktreePath != "" && opts.WorktreeRepoRoot != "" && opts.WorktreeBranch != "" {
 			go func() {
-				if err := git.RunPostWorktreeHook(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch); err != nil {
-					uiLog.Warn("post_worktree_hook_failed", slog.String("error", err.Error()))
+				for _, hook := range git.GetCreateHooks(opts.WorktreeRepoRoot) {
+					if err := git.RunWorktreeHook(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch, hook); err != nil {
+						uiLog.Warn("worktree_create_hook_failed",
+							slog.String("hook", hook.File),
+							slog.String("error", err.Error()))
+					}
 				}
 			}()
 		}

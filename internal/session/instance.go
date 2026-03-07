@@ -127,6 +127,10 @@ type Instance struct {
 	hookSessionID  string    // Session ID from hook payload
 	hookLastUpdate time.Time // When hook status was last received
 
+	// GroupDisplayName is the human-readable group name, populated from the GroupTree at runtime.
+	// Not persisted — derived from the group's Name field when instances are placed into groups.
+	GroupDisplayName string `json:"-"`
+
 	// mu protects fields written by backgroundStatusUpdate and read by the TUI goroutine.
 	// Use GetStatus()/SetStatus() and GetTool()/SetTool() for thread-safe access.
 	// UpdateStatus() acquires the write lock internally.
