@@ -648,29 +648,23 @@ func (t *GroupTree) MoveSessionToGroup(inst *Instance, newGroupPath string) {
 // sanitizeGroupName removes dangerous characters from group names
 // to prevent path traversal and other security issues
 func sanitizeGroupName(name string) string {
-	// Remove or replace dangerous characters
+	// Name is purely for display (paths use random IDs), so only strip
+	// control characters and path separators that could cause issues.
 	var result strings.Builder
 	result.Grow(len(name))
 
 	for _, r := range name {
-		// Allow letters, digits, spaces, hyphens, and underscores
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == ' ' || r == '-' || r == '_' {
-			result.WriteRune(r)
-		} else if r == '/' || r == '\\' || r == '.' {
-			// Replace path separators and dots with hyphens
-			result.WriteRune('-')
+		if unicode.IsControl(r) {
+			continue // strip control characters
 		}
-		// Other characters are dropped
+		if r == '/' || r == '\\' {
+			result.WriteRune('-') // replace path separators
+			continue
+		}
+		result.WriteRune(r)
 	}
 
-	// Clean up multiple consecutive hyphens
-	cleaned := result.String()
-	for strings.Contains(cleaned, "--") {
-		cleaned = strings.ReplaceAll(cleaned, "--", "-")
-	}
-
-	// Trim leading/trailing hyphens and spaces
-	cleaned = strings.Trim(cleaned, "- ")
+	cleaned := strings.TrimSpace(result.String())
 
 	// If the result is empty after sanitization, use a default
 	if cleaned == "" {
