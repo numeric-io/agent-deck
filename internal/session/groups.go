@@ -142,8 +142,13 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 
 	// First, create groups from stored data (preserves empty groups)
 	for _, gd := range storedGroups {
+		name := gd.Name
+		// Fix stale data: if a group's display name is a random ID, replace it
+		if isRandomGroupID(name) {
+			name = "Unnamed Group"
+		}
 		group := &Group{
-			Name:        gd.Name,
+			Name:        name,
 			Path:        gd.Path,
 			Expanded:    gd.Expanded,
 			Sessions:    []*Instance{},
