@@ -252,6 +252,11 @@ type Home struct {
 	worktreeDirtyCacheTs map[string]time.Time // sessionID -> cache timestamp
 	worktreeDirtyMu      sync.Mutex           // Protects dirty cache maps
 
+	// Worktree PR URL cache (lazy, 60s TTL)
+	worktreePRCache   map[string]string    // sessionID -> PR URL (empty string = no PR)
+	worktreePRCacheTs map[string]time.Time // sessionID -> cache timestamp
+	worktreePRMu      sync.Mutex           // Protects PR cache maps
+
 	// Memory management: periodic cache pruning
 	lastCachePrune time.Time
 
@@ -553,6 +558,12 @@ type worktreeDirtyCheckMsg struct {
 	err       error
 }
 
+// worktreePRCheckMsg is sent when an async PR URL lookup completes
+type worktreePRCheckMsg struct {
+	sessionID string
+	prURL     string
+}
+
 // worktreeFinishResultMsg is sent when the worktree finish operation completes
 type worktreeFinishResultMsg struct {
 	sessionID    string
@@ -666,6 +677,8 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		windowsCollapsed:     make(map[string]bool),
 		worktreeDirtyCache:   make(map[string]bool),
 		worktreeDirtyCacheTs: make(map[string]time.Time),
+		worktreePRCache:      make(map[string]string),
+		worktreePRCacheTs:    make(map[string]time.Time),
 		statusTrigger:        make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
 		statusWorkerDone:     make(chan struct{}),
 		lastPersistedStatus:  make(map[string]string),
@@ -3603,6 +3616,24 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return worktreeDirtyCheckMsg{sessionID: sid, isDirty: dirty, err: err}
 					})
 				}
+
+				// PR URL check (lazy, 60s TTL)
+				h.worktreePRMu.Lock()
+				prCacheTs, hasPRCached := h.worktreePRCacheTs[inst.ID]
+				needsPRCheck := !hasPRCached || time.Since(prCacheTs) > 60*time.Second
+				if needsPRCheck {
+					h.worktreePRCacheTs[inst.ID] = time.Now()
+				}
+				h.worktreePRMu.Unlock()
+				if needsPRCheck {
+					sid := inst.ID
+					repoDir := inst.WorktreeRepoRoot
+					branch := inst.WorktreeBranch
+					cmds = append(cmds, func() tea.Msg {
+						prURL := git.GetPullRequestURL(repoDir, branch)
+						return worktreePRCheckMsg{sessionID: sid, prURL: prURL}
+					})
+				}
 			}
 
 			if len(cmds) > 0 {
@@ -3673,6 +3704,13 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.worktreeFinishDialog.IsVisible() && h.worktreeFinishDialog.GetSessionID() == msg.sessionID && msg.err == nil {
 			h.worktreeFinishDialog.SetDirtyStatus(msg.isDirty)
 		}
+		return h, nil
+
+	case worktreePRCheckMsg:
+		h.worktreePRMu.Lock()
+		h.worktreePRCache[msg.sessionID] = msg.prURL
+		h.worktreePRCacheTs[msg.sessionID] = time.Now()
+		h.worktreePRMu.Unlock()
 		return h, nil
 
 	case worktreeFinishResultMsg:
@@ -9839,6 +9877,17 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(wtLabelStyle.Render("Status:  "))
 		b.WriteString(dirtyStyle.Render(dirtyLabel))
 		b.WriteString("\n")
+
+		// PR URL (lazy-cached, fetched via previewDebounce handler with 60s TTL)
+		h.worktreePRMu.Lock()
+		prURL, hasPRCached := h.worktreePRCache[selected.ID]
+		h.worktreePRMu.Unlock()
+		if hasPRCached && prURL != "" {
+			prStyle := lipgloss.NewStyle().Foreground(ColorCyan).Underline(true)
+			b.WriteString(wtLabelStyle.Render("PR:      "))
+			b.WriteString(prStyle.Render(prURL))
+			b.WriteString("\n")
+		}
 
 		// Finish hint
 		if finishKey := h.actionKey(hotkeyWorktreeFinish); finishKey != "" {

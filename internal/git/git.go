@@ -491,6 +491,18 @@ func HasUncommittedChanges(dir string) (bool, error) {
 	return strings.TrimSpace(string(output)) != "", nil
 }
 
+// GetPullRequestURL returns the GitHub/GitLab PR URL for the given branch, or "" if none exists.
+// Requires the `gh` CLI to be installed and authenticated.
+func GetPullRequestURL(repoDir, branch string) string {
+	cmd := exec.Command("gh", "pr", "view", branch, "--json", "url", "-q", ".url")
+	cmd.Dir = repoDir
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
 // GetDefaultBranch returns the default branch name (e.g. "main" or "master") for the repo
 func GetDefaultBranch(repoDir string) (string, error) {
 	// Try symbolic-ref first (works when remote HEAD is set)
