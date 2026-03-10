@@ -289,7 +289,7 @@ func TestGetHeartbeatInterval(t *testing.T) {
 		interval int
 		expected int
 	}{
-		{0, 15},  // default
+		{0, 0},   // zero means disabled
 		{-1, 15}, // negative defaults to 15
 		{10, 10}, // custom
 		{30, 30}, // custom
@@ -533,13 +533,15 @@ func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 	}
 }
 
-func TestBridgeTemplate_HeartbeatSelectsOnePerProfile(t *testing.T) {
+func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
 	template := conductorBridgePy
 
 	patterns := []string{
 		"def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:",
 		"conductors = select_heartbeat_conductors(all_conductors)",
-		"Multiple conductors may share a profile. Heartbeat auto-actions are profile-wide,",
+		`s_group = s.get("group", "") or ""`,
+		`if s_group != name and not s_group.startswith(f"{name}/"):`,
+		`for s in scoped_sessions:`,
 	}
 
 	for _, pattern := range patterns {
@@ -1825,6 +1827,16 @@ func TestBridgeTemplate_DiscordInMain(t *testing.T) {
 	}
 }
 
+func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "async with message.channel.typing():") {
+		t.Error("Discord on_message should show typing indicator while waiting for conductor response")
+	}
+	if !strings.Contains(template, "run_in_executor") {
+		t.Error("Discord on_message should offload blocking send_to_conductor to thread executor")
+	}
+}
+
 func TestConductorClearOnCompact(t *testing.T) {
 	// Override HOME so LoadConductorMeta reads from our temp dir
 	tmpHome := t.TempDir()
@@ -1863,5 +1875,56 @@ func TestConductorClearOnCompact(t *testing.T) {
 	nonConductor := &Instance{Title: "my-session", GroupPath: "conductor"}
 	if nonConductor.ConductorClearOnCompact() {
 		t.Error("non-conductor-prefixed title should return false")
+	}
+}
+
+// TestConductorHeartbeatScript_GroupScoped verifies the heartbeat script references
+// the conductor's own group (not all sessions in the profile) and includes an
+// enabled-config guard.
+func TestConductorHeartbeatScript_GroupScoped(t *testing.T) {
+	// The heartbeat message must NOT reference "all sessions in the {PROFILE} profile"
+	if strings.Contains(conductorHeartbeatScript, "Check all sessions in the") {
+		t.Fatal("heartbeat script should NOT reference 'all sessions in the {PROFILE} profile'; must be group-scoped")
+	}
+
+	// The heartbeat message must reference the conductor's own group via {NAME}
+	if !strings.Contains(conductorHeartbeatScript, "{NAME}") {
+		t.Fatal("heartbeat script must reference {NAME} for group scoping")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "Check sessions in") {
+		t.Fatal("heartbeat script should contain group-scoped message like 'Check sessions in'")
+	}
+
+	// The script must contain an enabled-config guard that queries conductor status
+	if !strings.Contains(conductorHeartbeatScript, "ENABLED") {
+		t.Fatal("heartbeat script must contain an ENABLED guard that checks conductor status before sending")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "conductor status") {
+		t.Fatal("heartbeat script must query conductor status to determine if enabled")
+	}
+}
+
+// TestGetHeartbeatInterval_ZeroMeansDisabled verifies interval=0 means disabled,
+// negative means use default, and positive means use the configured value.
+func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval int
+		expected int
+	}{
+		{"zero means disabled", 0, 0},
+		{"negative means default", -1, 15},
+		{"custom value", 30, 30},
+		{"explicit default", 15, 15},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := ConductorSettings{HeartbeatInterval: tt.interval}
+			got := settings.GetHeartbeatInterval()
+			if got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
+			}
+		})
 	}
 }

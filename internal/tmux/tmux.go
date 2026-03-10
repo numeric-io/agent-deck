@@ -57,11 +57,16 @@ var (
 func RefreshSessionCache() {
 	// Try control mode pipe first (zero subprocess)
 	if pm := GetPipeManager(); pm != nil {
-		if activities, err := pm.RefreshAllActivities(); err == nil && len(activities) > 0 {
+		if activities, windows, err := pm.RefreshAllActivities(); err == nil && len(activities) > 0 {
 			sessionCacheMu.Lock()
 			sessionCacheData = activities
 			sessionCacheTime = time.Now()
 			sessionCacheMu.Unlock()
+
+			windowCacheMu.Lock()
+			windowCacheData = windows
+			windowCacheTime = time.Now()
+			windowCacheMu.Unlock()
 			return
 		}
 		// Pipe failed: log it so we can verify zero subprocess usage
@@ -69,7 +74,7 @@ func RefreshSessionCache() {
 	}
 
 	// Subprocess fallback: list-windows -a
-	cmd := exec.Command("tmux", "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}")
+	cmd := exec.Command("tmux", "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}")
 	output, err := cmd.Output()
 	if err != nil {
 		sessionCacheMu.Lock()
@@ -79,28 +84,56 @@ func RefreshSessionCache() {
 		return
 	}
 
-	newCache := make(map[string]int64)
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+	newSessionCache, newWindowCache := parseListWindowsOutput(string(output))
+
+	sessionCacheMu.Lock()
+	sessionCacheData = newSessionCache
+	sessionCacheTime = time.Now()
+	sessionCacheMu.Unlock()
+
+	windowCacheMu.Lock()
+	windowCacheData = newWindowCache
+	windowCacheTime = time.Now()
+	windowCacheMu.Unlock()
+}
+
+// parseListWindowsOutput parses the output of `tmux list-windows -a` with the extended format
+// "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}"
+// Returns session-level max activity and per-session window info.
+func parseListWindowsOutput(output string) (map[string]int64, map[string][]WindowInfo) {
+	sessionCache := make(map[string]int64)
+	windowCache := make(map[string][]WindowInfo)
+
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) < 2 {
 			continue
 		}
 		name := parts[0]
 		var activity int64
-		_, _ = fmt.Sscanf(parts[1], "%d", &activity) // ignore error, 0 is valid default
-		// Keep maximum activity (most recent) if session has multiple windows
-		if existing, ok := newCache[name]; !ok || activity > existing {
-			newCache[name] = activity
+		_, _ = fmt.Sscanf(parts[1], "%d", &activity)
+
+		// Session-level: keep max activity
+		if existing, ok := sessionCache[name]; !ok || activity > existing {
+			sessionCache[name] = activity
+		}
+
+		// Window-level: only if we have index and name fields
+		if len(parts) == 4 {
+			var idx int
+			_, _ = fmt.Sscanf(parts[2], "%d", &idx)
+			windowCache[name] = append(windowCache[name], WindowInfo{
+				Index:    idx,
+				Name:     parts[3],
+				Activity: activity,
+			})
 		}
 	}
 
-	sessionCacheMu.Lock()
-	sessionCacheData = newCache
-	sessionCacheTime = time.Now()
-	sessionCacheMu.Unlock()
+	return sessionCache, windowCache
 }
 
 // RefreshExistingSessions is an alias for RefreshSessionCache for backwards compatibility
@@ -324,7 +357,7 @@ func SupportsHyperlinks() bool {
 }
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
-var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex"}
+var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "pi"}
 
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
 	"claude": {
@@ -345,10 +378,36 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`(?i)codex`),
 		regexp.MustCompile(`(?i)openai`),
 	},
+	"pi": {
+		regexp.MustCompile(`(?mi)^\s*pi>\s*`),
+		regexp.MustCompile(`(?i)\bpi\s+cli\b`),
+		regexp.MustCompile(`(?i)\bpi\s+code\b`),
+	},
 }
 
 func detectToolFromCommand(command string) string {
 	cmdLower := strings.ToLower(strings.TrimSpace(command))
+	if cmdLower == "" {
+		return ""
+	}
+
+	fields := strings.Fields(cmdLower)
+	if len(fields) > 0 {
+		base := filepath.Base(fields[0])
+		switch base {
+		case "claude":
+			return "claude"
+		case "gemini":
+			return "gemini"
+		case "opencode", "open-code":
+			return "opencode"
+		case "codex":
+			return "codex"
+		case "pi":
+			return "pi"
+		}
+	}
+
 	switch {
 	case strings.Contains(cmdLower, "claude"):
 		return "claude"
@@ -358,6 +417,8 @@ func detectToolFromCommand(command string) string {
 		return "opencode"
 	case strings.Contains(cmdLower, "codex"):
 		return "codex"
+	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
+		return "pi"
 	default:
 		return ""
 	}
@@ -899,11 +960,13 @@ func (s *Session) InvalidateEnvCache() {
 	s.envCacheMu.Unlock()
 }
 
+// sanitizeNameRe matches characters not allowed in tmux session names.
+var sanitizeNameRe = regexp.MustCompile(`[^a-zA-Z0-9-]+`)
+
 // sanitizeName converts a display name to a valid tmux session name
 func sanitizeName(name string) string {
 	// Replace spaces and special characters with hyphens
-	re := regexp.MustCompile(`[^a-zA-Z0-9-]+`)
-	return re.ReplaceAllString(name, "-")
+	return sanitizeNameRe.ReplaceAllString(name, "-")
 }
 
 func shouldRecoverFromTmuxStartError(output string) bool {
@@ -1666,6 +1729,17 @@ func (s *Session) CaptureFullHistory() (string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to capture history: %w", err)
+	}
+	return string(output), nil
+}
+
+// CaptureWindowFullHistory captures the scrollback history of a specific window (last 2000 lines).
+func (s *Session) CaptureWindowFullHistory(windowIndex int) (string, error) {
+	target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-e", "-S", "-2000")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to capture window %d history: %w", windowIndex, err)
 	}
 	return string(output), nil
 }

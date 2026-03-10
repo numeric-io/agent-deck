@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -175,6 +176,16 @@ type Home struct {
 	notesDialog          *NotesDialog          // For editing group notes
 	bridgeStatusDialog   *BridgeStatusDialog   // For viewing bridge daemon status
 
+	// Configurable hotkeys
+	hotkeys        map[string]string // action -> configured key
+	hotkeyLookup   map[string]string // pressed key -> canonical key used by switch cases
+	blockedHotkeys map[string]bool   // canonical keys disabled via remap/unbind
+
+	// Inline preview notes editing
+	notesEditor           textarea.Model
+	notesEditing          bool
+	notesEditingSessionID string
+
 	// Analytics cache (async fetching with TTL)
 	currentAnalytics       *session.SessionAnalytics                  // Current analytics for selected session (Claude)
 	currentGeminiAnalytics *session.GeminiSessionAnalytics            // Current analytics for selected session (Gemini)
@@ -209,8 +220,8 @@ type Home struct {
 
 	// Preview debouncing (PERFORMANCE: prevents subprocess spawn on every keystroke)
 	// During rapid navigation, we delay preview fetch by 150ms to let navigation settle
-	pendingPreviewID  string     // Session ID waiting for debounced fetch
-	previewDebounceMu sync.Mutex // Protects pendingPreviewID
+	pendingPreviewKey string     // Preview key waiting for debounced fetch
+	previewDebounceMu sync.Mutex // Protects pendingPreviewKey
 
 	// Round-robin status updates (Priority 1A optimization)
 	// Instead of updating ALL sessions every tick, we update batches of 5-10 sessions
@@ -219,8 +230,10 @@ type Home struct {
 
 	// Background status worker (Priority 1C optimization)
 	// Moves status updates to a separate goroutine, completely decoupling from UI
-	statusTrigger    chan statusUpdateRequest // Triggers background status update
-	statusWorkerDone chan struct{}            // Signals worker has stopped
+	statusTrigger       chan statusUpdateRequest // Triggers background status update
+	statusWorkerDone    chan struct{}            // Signals worker has stopped
+	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last full background status sweep
+	lastPersistedStatus map[string]string        // instanceID -> last status written to SQLite
 
 	// PERFORMANCE: Worker pool for output-driven status updates (Priority 2)
 	// Caps the number of goroutines spawned for %output events from control pipes
@@ -230,6 +243,9 @@ type Home struct {
 	// PERFORMANCE: Debounce output activity status updates
 	lastLogActivity map[string]time.Time // sessionID -> last update time
 	logActivityMu   sync.Mutex           // Protects lastLogActivity map
+
+	// Window toggle state — sessions with collapsed window sub-items
+	windowsCollapsed map[string]bool // sessionID -> true if windows hidden
 
 	// Worktree dirty status cache (lazy, 10s TTL)
 	worktreeDirtyCache   map[string]bool      // sessionID -> isDirty
@@ -296,6 +312,14 @@ type Home struct {
 	// Navigation tracking (PERFORMANCE: suspend background updates during rapid navigation)
 	lastNavigationTime time.Time // When user last navigated (up/down/j/k)
 	isNavigating       bool      // True if user is rapidly navigating
+	lastAttachReturn   time.Time // When we returned from tea.Exec attach/detach
+	navigationHotUntil atomic.Int64
+	// Snapshot of status/tool used by render path to avoid per-row lock contention.
+	sessionRenderSnapshot atomic.Value // map[string]sessionRenderState
+
+	// Jump mode (vimium-style hint navigation)
+	jumpMode   bool   // True when jump mode is active
+	jumpBuffer string // Characters typed so far in jump mode
 
 	// Cached status counts (invalidated on instance changes)
 	cachedStatusCounts struct {
@@ -313,12 +337,13 @@ type Home struct {
 	viewBuilder strings.Builder
 
 	// Notification bar (tmux status-left for waiting sessions)
-	notificationManager  *session.NotificationManager
-	notificationsEnabled bool
-	boundKeys            map[string]string // Track which key is bound (key -> "sessionID:tmuxName")
-	boundKeysMu          sync.Mutex        // Protects boundKeys for background worker access
-	lastBarText          string            // Cache to avoid updating all sessions every tick
-	lastBarTextMu        sync.Mutex        // Protects lastBarText for background worker access
+	notificationManager     *session.NotificationManager
+	notificationsEnabled    bool
+	manageTmuxNotifications bool
+	boundKeys               map[string]string // Track which key is bound (key -> "sessionID:tmuxName")
+	boundKeysMu             sync.Mutex        // Protects boundKeys for background worker access
+	lastBarText             string            // Cache to avoid updating all sessions every tick
+	lastBarTextMu           sync.Mutex        // Protects lastBarText for background worker access
 
 	// Maintenance banner (shown after background maintenance completes)
 	maintenanceMsg     string
@@ -365,6 +390,35 @@ type uiState struct {
 	StatusFilter    string `json:"status_filter,omitempty"`
 }
 
+func (h *Home) reloadHotkeysFromConfig() {
+	h.setHotkeys(resolveHotkeys(session.GetHotkeyOverrides()))
+}
+
+func (h *Home) setHotkeys(bindings map[string]string) {
+	if bindings == nil {
+		bindings = resolveHotkeys(nil)
+	}
+	h.hotkeys = bindings
+	h.hotkeyLookup, h.blockedHotkeys = buildHotkeyLookup(bindings)
+	if h.helpOverlay != nil {
+		h.helpOverlay.SetHotkeys(bindings)
+	}
+}
+
+func (h *Home) normalizeMainKey(pressed string) string {
+	if canonical, ok := h.hotkeyLookup[pressed]; ok {
+		return canonical
+	}
+	if h.blockedHotkeys[pressed] {
+		return ""
+	}
+	return pressed
+}
+
+func (h *Home) actionKey(action string) string {
+	return actionHotkey(h.hotkeys, action)
+}
+
 // deletedSessionEntry holds a deleted session for undo restore
 type deletedSessionEntry struct {
 	instance  *session.Instance
@@ -407,7 +461,10 @@ type sessionForkedMsg struct {
 
 type refreshMsg struct{}
 
-type statusUpdateMsg struct{} // Triggers immediate status update without reloading
+type statusUpdateMsg struct {
+	attachedSessionID string // Session that just returned from attach (if local attach)
+	attachedWorkDir   string // pane_current_path captured after attach returns
+} // Triggers immediate status update without reloading
 
 // storageChangedMsg signals that state.db was modified externally
 type storageChangedMsg struct{}
@@ -430,15 +487,17 @@ type (
 
 // previewFetchedMsg is sent when async preview content is ready
 type previewFetchedMsg struct {
-	sessionID string
-	content   string
-	err       error
+	previewKey string // cache key: sessionID or sessionID:windowIndex
+	content    string
+	err        error
 }
 
 // previewDebounceMsg signals debounce period elapsed for preview fetch
 // PERFORMANCE: Delays preview fetch during rapid navigation
 type previewDebounceMsg struct {
-	sessionID string
+	previewKey  string // cache key
+	sessionID   string // parent session ID (for instance lookup)
+	windowIndex int    // -1 for session, >= 0 for specific window
 }
 
 // analyticsFetchedMsg is sent when async analytics parsing is complete
@@ -513,6 +572,15 @@ type statusUpdateRequest struct {
 	viewOffset    int      // Current scroll position
 	visibleHeight int      // How many items fit on screen
 	flatItemIDs   []string // IDs of sessions in current flatItems order (for visible detection)
+}
+
+func newNotesEditor() textarea.Model {
+	editor := textarea.New()
+	editor.ShowLineNumbers = false
+	editor.Placeholder = "Write notes for this session..."
+	editor.Prompt = ""
+	editor.Blur()
+	return editor
 }
 
 // NewHome creates a new home model with the default profile
@@ -595,15 +663,24 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		mcpLoadingSessions:   make(map[string]time.Time),
 		forkingSessions:      make(map[string]time.Time),
 		lastLogActivity:      make(map[string]time.Time),
+		windowsCollapsed:     make(map[string]bool),
 		worktreeDirtyCache:   make(map[string]bool),
 		worktreeDirtyCacheTs: make(map[string]time.Time),
 		statusTrigger:        make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
 		statusWorkerDone:     make(chan struct{}),
+		lastPersistedStatus:  make(map[string]string),
 		logUpdateChan:        make(chan *session.Instance, 100), // Buffered to absorb bursts
+		hotkeys:              make(map[string]string),
+		hotkeyLookup:         make(map[string]string),
+		blockedHotkeys:       make(map[string]bool),
+		notesEditor:          newNotesEditor(),
 		boundKeys:            make(map[string]string),
 		undoStack:            make([]deletedSessionEntry, 0, 10),
 		pendingTitleChanges:  make(map[string]string),
 	}
+	h.sessionRenderSnapshot.Store(make(map[string]sessionRenderState))
+
+	h.reloadHotkeysFromConfig()
 
 	// Keep settings panel profile-aware so profile overrides (e.g., Claude config dir)
 	// are displayed and edited in the correct scope.
@@ -612,10 +689,13 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// Restore persisted UI state (preview mode, status filter, cursor position)
 	h.loadUIState()
 
-	// Initialize notification manager if enabled in config
+	tmuxSettings := session.GetTmuxSettings()
+	h.manageTmuxNotifications = tmuxSettings.GetInjectStatusLine()
+
+	// Initialize notification manager if enabled in config and tmux status injection is allowed.
 	// All instances manage the notification bar (they share SQLite state, so produce identical output)
 	notifSettings := session.GetNotificationsSettings()
-	if notifSettings.Enabled {
+	if notifSettings.Enabled && h.manageTmuxNotifications {
 		h.notificationsEnabled = true
 		h.notificationManager = session.NewNotificationManager(notifSettings.MaxShown, notifSettings.ShowAll, notifSettings.Minimal)
 
@@ -651,6 +731,12 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 
 	// Control mode pipes: event-driven, zero-subprocess status detection
 	pm := tmux.NewPipeManager(h.ctx, outputCallback)
+
+	// Window change callback: refresh window cache immediately when tabs are added/closed
+	pm.SetWindowChangeCallback(func() {
+		tmux.RefreshSessionCache()
+	})
+
 	tmux.SetPipeManager(pm)
 
 	// Connect pipes for all existing running sessions in background
@@ -934,8 +1020,33 @@ func (h *Home) restoreState(state reloadState) {
 	}
 }
 
+// sessionHasWindows returns true if the session item has 2+ cached tmux windows.
+func (h *Home) sessionHasWindows(item session.Item) bool {
+	if item.Session == nil {
+		return false
+	}
+	tmuxSess := item.Session.GetTmuxSession()
+	if tmuxSess == nil {
+		return false
+	}
+	return len(tmux.GetCachedWindows(tmuxSess.Name)) >= 2
+}
+
+// moveCursorToSession moves the cursor to the flat item matching the given session ID.
+func (h *Home) moveCursorToSession(sessionID string) {
+	for i, fi := range h.flatItems {
+		if fi.Type == session.ItemTypeSession && fi.Session != nil && fi.Session.ID == sessionID {
+			h.cursor = i
+			return
+		}
+	}
+}
+
 // rebuildFlatItems rebuilds the flattened view from group tree
 func (h *Home) rebuildFlatItems() {
+	h.jumpMode = false
+	h.jumpBuffer = ""
+
 	allItems := h.groupTree.Flatten()
 
 	// Hide default group when empty; inject notes items for non-default groups
@@ -1003,6 +1114,43 @@ func (h *Home) rebuildFlatItems() {
 		h.flatItems = filtered
 	} else {
 		h.flatItems = allItems
+	}
+
+	// Inject window items after sessions that have 2+ windows
+	if len(h.flatItems) > 0 {
+		expanded := make([]session.Item, 0, len(h.flatItems)+8)
+		for _, item := range h.flatItems {
+			expanded = append(expanded, item)
+
+			if item.Type != session.ItemTypeSession || item.Session == nil {
+				continue
+			}
+			tmuxSess := item.Session.GetTmuxSession()
+			if tmuxSess == nil {
+				continue
+			}
+			wins := tmux.GetCachedWindows(tmuxSess.Name)
+			if len(wins) < 2 || h.windowsCollapsed[item.Session.ID] {
+				continue
+			}
+
+			for winIdx, win := range wins {
+				expanded = append(expanded, session.Item{
+					Type:                session.ItemTypeWindow,
+					WindowIndex:         win.Index,
+					WindowName:          win.Name,
+					WindowTool:          win.Tool,
+					WindowSessionID:     item.Session.ID,
+					Level:               item.Level + 1,
+					Path:                item.Path,
+					IsWindow:            true,
+					IsLastWindow:        winIdx == len(wins)-1,
+					IsLastInGroup:       item.IsLastInGroup && winIdx == len(wins)-1,
+					ParentIsLastInGroup: item.IsLastInGroup,
+				})
+			}
+		}
+		h.flatItems = expanded
 	}
 
 	// Append remote sessions as selectable items
@@ -1205,7 +1353,7 @@ func (h *Home) getAttachedSessionID() string {
 
 // cleanupNotifications removes all notification bar state on exit
 func (h *Home) cleanupNotifications() {
-	if !h.notificationsEnabled || h.notificationManager == nil {
+	if !h.manageTmuxNotifications || !h.notificationsEnabled || h.notificationManager == nil {
 		return
 	}
 
@@ -1493,7 +1641,7 @@ func (h *Home) cleanupExpiredAnimations(
 		// Use appropriate timeout based on tool
 		// Claude and Gemini use longer timeout (MCP loading can be slow)
 		timeout := defaultTimeout
-		if inst.Tool == "claude" || inst.Tool == "gemini" {
+		if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "gemini" {
 			timeout = claudeTimeout
 		}
 		if time.Since(startTime) > timeout {
@@ -1507,7 +1655,7 @@ func (h *Home) cleanupExpiredAnimations(
 }
 
 func launchAnimationMinDuration(tool string) time.Duration {
-	if tool == "claude" || tool == "gemini" {
+	if session.IsClaudeCompatible(tool) || tool == "gemini" {
 		return minLaunchAnimationDurationClaude
 	}
 	return minLaunchAnimationDurationDefault
@@ -1615,37 +1763,83 @@ func (h *Home) hasActiveAnimation(sessionID string) bool {
 	return true
 }
 
-// fetchPreview returns a command that asynchronously fetches preview content
-// This keeps View() pure (no blocking I/O) as per Bubble Tea best practices
-func (h *Home) fetchPreview(inst *session.Instance) tea.Cmd {
+// previewCacheKey returns the cache key for a preview: sessionID or sessionID:windowIndex.
+func previewCacheKey(sessionID string, windowIndex int) string {
+	if windowIndex < 0 {
+		return sessionID
+	}
+	return fmt.Sprintf("%s:%d", sessionID, windowIndex)
+}
+
+// fetchPreview returns a command that asynchronously fetches preview content.
+// windowIndex < 0 captures the session's primary pane; >= 0 captures a specific window.
+func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int) tea.Cmd {
 	if inst == nil {
 		return nil
 	}
-	sessionID := inst.ID
 	return func() tea.Msg {
-		content, err := inst.PreviewFull()
+		var content string
+		var err error
+		if windowIndex >= 0 {
+			content, err = inst.PreviewWindowFull(windowIndex)
+		} else {
+			content, err = inst.PreviewFull()
+		}
 		return previewFetchedMsg{
-			sessionID: sessionID,
-			content:   content,
-			err:       err,
+			previewKey: key,
+			content:    content,
+			err:        err,
 		}
 	}
 }
 
-// fetchPreviewDebounced returns a command that triggers preview fetch after debounce delay
-// PERFORMANCE: Prevents rapid subprocess spawning during keyboard navigation
-// The 150ms delay allows navigation to settle before spawning tmux capture-pane
-func (h *Home) fetchPreviewDebounced(sessionID string) tea.Cmd {
+// fetchPreviewDebounced returns a command that triggers preview fetch after debounce delay.
+// PERFORMANCE: Prevents rapid subprocess spawning during keyboard navigation.
+func (h *Home) fetchPreviewDebounced(sessionID string, windowIndex int) tea.Cmd {
 	const debounceDelay = 150 * time.Millisecond
 
+	key := previewCacheKey(sessionID, windowIndex)
 	h.previewDebounceMu.Lock()
-	h.pendingPreviewID = sessionID
+	h.pendingPreviewKey = key
 	h.previewDebounceMu.Unlock()
 
 	return func() tea.Msg {
 		time.Sleep(debounceDelay)
-		return previewDebounceMsg{sessionID: sessionID}
+		return previewDebounceMsg{previewKey: key, sessionID: sessionID, windowIndex: windowIndex}
 	}
+}
+
+// selectedPreviewTarget returns the instance, cache key, and window index for the currently
+// selected flat item. windowIndex is -1 for session items.
+func (h *Home) selectedPreviewTarget() (*session.Instance, string, int) {
+	if h.cursor >= len(h.flatItems) {
+		return nil, "", -1
+	}
+	item := h.flatItems[h.cursor]
+	switch item.Type {
+	case session.ItemTypeSession:
+		if item.Session == nil {
+			return nil, "", -1
+		}
+		return item.Session, item.Session.ID, -1
+	case session.ItemTypeWindow:
+		inst := h.getInstanceByID(item.WindowSessionID)
+		if inst == nil {
+			return nil, "", -1
+		}
+		return inst, previewCacheKey(inst.ID, item.WindowIndex), item.WindowIndex
+	}
+	return nil, "", -1
+}
+
+// fetchSelectedPreview debounces a preview fetch for the currently selected item.
+// Handles both session and window items transparently.
+func (h *Home) fetchSelectedPreview() tea.Cmd {
+	inst, _, winIdx := h.selectedPreviewTarget()
+	if inst == nil {
+		return nil
+	}
+	return h.fetchPreviewDebounced(inst.ID, winIdx)
 }
 
 // detectOpenCodeSessionCmd returns a command that asynchronously detects
@@ -1759,7 +1953,70 @@ func (h *Home) getSelectedSession() *session.Instance {
 	if item.Type == session.ItemTypeSession {
 		return item.Session
 	}
+	if item.Type == session.ItemTypeWindow {
+		return h.getInstanceByID(item.WindowSessionID)
+	}
 	return nil
+}
+
+type sessionRenderState struct {
+	status session.Status
+	tool   string
+}
+
+func (h *Home) getSessionRenderSnapshot() map[string]sessionRenderState {
+	if snap := h.sessionRenderSnapshot.Load(); snap != nil {
+		if typed, ok := snap.(map[string]sessionRenderState); ok {
+			return typed
+		}
+	}
+	return nil
+}
+
+func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
+	if instances == nil {
+		h.instancesMu.RLock()
+		instances = make([]*session.Instance, len(h.instances))
+		copy(instances, h.instances)
+		h.instancesMu.RUnlock()
+	}
+
+	snap := make(map[string]sessionRenderState, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		snap[inst.ID] = sessionRenderState{
+			status: inst.GetStatusThreadSafe(),
+			tool:   inst.GetToolThreadSafe(),
+		}
+	}
+	h.sessionRenderSnapshot.Store(snap)
+}
+
+func (h *Home) getSessionRenderState(inst *session.Instance) sessionRenderState {
+	if inst == nil {
+		return sessionRenderState{}
+	}
+	if snap := h.getSessionRenderSnapshot(); snap != nil {
+		if state, ok := snap[inst.ID]; ok {
+			return state
+		}
+	}
+	// Fallback for newly-added sessions before snapshot refresh.
+	return sessionRenderState{
+		status: inst.GetStatusThreadSafe(),
+		tool:   inst.GetToolThreadSafe(),
+	}
+}
+
+// markNavigationActivity records a short "hot" window where background workers
+// should avoid heavy refresh work to keep key navigation responsive.
+func (h *Home) markNavigationActivity() {
+	now := time.Now()
+	h.lastNavigationTime = now
+	h.isNavigating = true
+	h.navigationHotUntil.Store(now.Add(900 * time.Millisecond).UnixNano())
 }
 
 // getInstanceByID returns the instance with the given ID using O(1) map lookup
@@ -1817,6 +2074,11 @@ func (h *Home) statusWorker() {
 		case <-ticker.C:
 			// Self-triggered update - runs even when TUI is paused
 			h.backgroundStatusUpdate()
+			// Coalesce a queued immediate request after full sweep.
+			select {
+			case <-h.statusTrigger:
+			default:
+			}
 
 		case req := <-h.statusTrigger:
 			// Explicit trigger from TUI (for immediate updates)
@@ -1878,6 +2140,9 @@ func (h *Home) backgroundStatusUpdate() {
 	}()
 
 	totalStart := time.Now()
+	if hotUntil := h.navigationHotUntil.Load(); hotUntil > 0 && time.Now().UnixNano() < hotUntil {
+		return
+	}
 
 	// Refresh tmux session cache
 	refreshStart := time.Now()
@@ -1914,7 +2179,7 @@ func (h *Home) backgroundStatusUpdate() {
 	// Feed hook statuses from watcher to instances (enables hook fast path in UpdateStatus)
 	if h.hookWatcher != nil {
 		for _, inst := range instances {
-			if inst.Tool == "claude" || inst.Tool == "codex" {
+			if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" {
 				if hs := h.hookWatcher.GetHookStatus(inst.ID); hs != nil {
 					inst.UpdateHookStatus(hs)
 				}
@@ -1925,7 +2190,7 @@ func (h *Home) backgroundStatusUpdate() {
 	// Proactive context-% monitoring: send /clear before auto-compact triggers
 	// For conductor sessions with clear_on_compact enabled, check cached analytics
 	for _, inst := range instances {
-		if inst.Tool != "claude" || inst.GroupPath != "conductor" {
+		if !session.IsClaudeCompatible(inst.Tool) || inst.GroupPath != "conductor" {
 			continue
 		}
 		if !inst.ConductorClearOnCompact() {
@@ -1951,11 +2216,11 @@ func (h *Home) backgroundStatusUpdate() {
 					_ = tmuxSess.SendKeysAndEnter("/clear")
 					// After /clear wipes context, immediately send heartbeat to restore orientation
 					time.Sleep(3 * time.Second)
-					profile := session.DefaultProfile
+					_ = session.DefaultProfile
 					if meta, err := session.LoadConductorMeta(conductorName); err == nil {
-						profile = meta.Profile
+						_ = meta.Profile
 					}
-					msg := fmt.Sprintf("Heartbeat: Check all sessions in the %s profile. List any waiting sessions, auto-respond where safe, and report what needs my attention.", profile)
+					msg := fmt.Sprintf("Heartbeat: Check sessions in your group (%s). List any that are waiting, auto-respond where safe, and report what needs my attention.", conductorName)
 					_ = tmuxSess.SendKeysAndEnter(msg)
 				}()
 			}
@@ -2037,6 +2302,7 @@ func (h *Home) backgroundStatusUpdate() {
 		h.cachedStatusCounts.valid.Store(false)
 		h.publishWebSessionStates(instances)
 	}
+	h.refreshSessionRenderSnapshot(instances)
 
 	// SQLite sync: heartbeat, status writes, ack reads (enables multi-instance coordination)
 	if db := statedb.GetGlobal(); db != nil {
@@ -2049,9 +2315,21 @@ func (h *Home) backgroundStatusUpdate() {
 			h.lastDeadInstanceCleanup = time.Now()
 		}
 
-		// Write current status for each instance so other TUI instances stay in sync
+		// Write statuses only when changed to reduce SQLite write pressure.
+		currentIDs := make(map[string]struct{}, len(instances))
 		for _, inst := range instances {
-			_ = db.WriteStatus(inst.ID, string(inst.GetStatusThreadSafe()), inst.Tool)
+			currentIDs[inst.ID] = struct{}{}
+			status := string(inst.GetStatusThreadSafe())
+			if prev, ok := h.lastPersistedStatus[inst.ID]; ok && prev == status {
+				continue
+			}
+			_ = db.WriteStatus(inst.ID, status, inst.Tool)
+			h.lastPersistedStatus[inst.ID] = status
+		}
+		for id := range h.lastPersistedStatus {
+			if _, ok := currentIDs[id]; !ok {
+				delete(h.lastPersistedStatus, id)
+			}
 		}
 
 		// Read acknowledgments from SQLite (picks up acks from other instances)
@@ -2080,6 +2358,7 @@ func (h *Home) backgroundStatusUpdate() {
 			slog.Duration("refresh", refreshDur),
 			slog.Int("sessions", len(instances)))
 	}
+	h.lastFullStatusSweep.Store(time.Now().UnixNano())
 }
 
 // syncNotificationsBackground updates the tmux notification bar directly
@@ -2091,7 +2370,7 @@ func (h *Home) syncNotificationsBackground() {
 		}
 	}()
 
-	if !h.notificationsEnabled || h.notificationManager == nil {
+	if !h.manageTmuxNotifications || !h.notificationsEnabled || h.notificationManager == nil {
 		return
 	}
 
@@ -2222,6 +2501,10 @@ func (h *Home) syncNotificationsBackground() {
 // updateKeyBindings updates tmux key bindings based on current notification entries.
 // Thread-safe via boundKeysMu. Can be called from both foreground and background.
 func (h *Home) updateKeyBindings() {
+	if !h.manageTmuxNotifications {
+		return
+	}
+
 	// Minimal mode shows counts only — no named slots, no key bindings to manage
 	if h.notificationManager.IsMinimal() {
 		return
@@ -2322,6 +2605,15 @@ func (h *Home) triggerStatusUpdate() {
 // With batching (3 visible + 2 non-visible per tick), we keep each tick under 100ms.
 func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 	const batchSize = 2 // Reduced from 5 to 2 - fewer CapturePane() calls per tick
+	if hotUntil := h.navigationHotUntil.Load(); hotUntil > 0 && time.Now().UnixNano() < hotUntil {
+		return
+	}
+	if last := h.lastFullStatusSweep.Load(); last > 0 {
+		if time.Since(time.Unix(0, last)) < 1500*time.Millisecond {
+			// A full all-session sweep just ran; skip redundant incremental update.
+			return
+		}
+	}
 
 	// CRITICAL FIX: Refresh session cache in background worker, NOT main goroutine
 	// This prevents UI freezing when subprocess spawning is slow (high system load)
@@ -2400,6 +2692,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 		h.cachedStatusCounts.valid.Store(false)
 		h.publishWebSessionStates(instancesCopy)
 	}
+	h.refreshSessionRenderSnapshot(instancesCopy)
 }
 
 // Update handles messages
@@ -2430,6 +2723,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		h.reloadMu.Unlock()
 		h.initialLoading = false // First load complete, hide splash
+		h.reloadHotkeysFromConfig()
 
 		// Show hooks installation prompt (after splash screen is gone)
 		if h.pendingHooksPrompt && !h.setupWizard.IsVisible() {
@@ -2494,6 +2788,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			h.instancesMu.Unlock()
+			h.refreshSessionRenderSnapshot(msg.instances)
 			// Invalidate status counts cache
 			h.cachedStatusCounts.valid.Store(false)
 			// Sync group tree with loaded data
@@ -2599,7 +2894,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewFetchingID = selected.ID
 				h.previewCacheMu.Unlock()
 				// Batch preview fetch with any OpenCode detection commands
-				allCmds := append(detectionCmds, h.fetchPreview(selected))
+				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1))
 				return h, tea.Batch(allCmds...)
 			}
 			// No selection, but still run detection commands if any
@@ -2669,7 +2964,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.forceSaveInstances()
 
 			// Start fetching preview for the new session
-			return h, h.fetchPreview(msg.instance)
+			return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
 		}
 		return h, nil
 
@@ -2736,7 +3031,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.forceSaveInstances()
 
 			// Start fetching preview for the forked session
-			return h, h.fetchPreview(msg.instance)
+			return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
 		}
 		return h, nil
 
@@ -2807,7 +3102,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Show undo hint (using setError as a transient message)
 		if deletedInstance != nil {
-			h.setError(fmt.Errorf("deleted '%s'. Ctrl+Z to undo", deletedInstance.Title))
+			if undoKey := h.actionKey(hotkeyUndoDelete); undoKey != "" {
+				h.setError(fmt.Errorf("deleted '%s'. %s to undo", deletedInstance.Title, undoKey))
+			} else {
+				h.setError(fmt.Errorf("deleted '%s'", deletedInstance.Title))
+			}
 		}
 
 		// If there are cleanup hooks requiring confirmation, show the dialog
@@ -2818,6 +3117,29 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				msg.cleanupWorktreePath,
 				msg.cleanupBranch,
 			)
+		}
+		return h, nil
+
+	case sessionClosedMsg:
+		// Keep session metadata, just reflect runtime termination state.
+		if msg.killErr != nil {
+			h.setError(fmt.Errorf("failed to close session: %w", msg.killErr))
+			return h, nil
+		}
+
+		h.cachedStatusCounts.valid.Store(false)
+		h.invalidatePreviewCache(msg.sessionID)
+		h.rebuildFlatItems()
+		h.saveInstances()
+
+		restartHint := ""
+		if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
+			restartHint = fmt.Sprintf(". %s to restart", restartKey)
+		}
+		if inst := h.getInstanceByID(msg.sessionID); inst != nil {
+			h.setError(fmt.Errorf("closed '%s'%s", inst.Title, restartHint))
+		} else {
+			h.setError(fmt.Errorf("session closed%s", restartHint))
 		}
 		return h, nil
 
@@ -2876,8 +3198,12 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Use forceSave to bypass mtime check - restore MUST persist
 		h.forceSaveInstances()
-		h.setError(fmt.Errorf("restored '%s'", msg.instance.Title))
-		return h, h.fetchPreview(msg.instance)
+		if msg.warning != "" {
+			h.setError(fmt.Errorf("restored '%s' (%s)", msg.instance.Title, msg.warning))
+		} else {
+			h.setError(fmt.Errorf("restored '%s'", msg.instance.Title))
+		}
+		return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
 
 	case openCodeDetectionCompleteMsg:
 		// OpenCode session detection completed
@@ -2922,6 +3248,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.invalidatePreviewCache(msg.sessionID)
 			// Save the updated session state (new tmux session name)
 			h.saveInstances()
+			if msg.warning != "" {
+				h.setError(fmt.Errorf("%s", msg.warning))
+			}
 		}
 		// Clear animation so ENTER can attach immediately.
 		delete(h.resumingSessions, msg.sessionID)
@@ -2978,6 +3307,30 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.remoteSessionsMu.Unlock()
 		h.rebuildFlatItems()
 		return h, nil
+
+	case remoteSessionDeletedMsg:
+		if msg.err != nil {
+			h.setError(fmt.Errorf("failed to delete remote session: %w", msg.err))
+			return h, nil
+		}
+		h.setError(fmt.Errorf("deleted '%s' on %s", msg.title, msg.remoteName))
+		return h, h.fetchRemoteSessions
+
+	case remoteSessionClosedMsg:
+		if msg.err != nil {
+			h.setError(fmt.Errorf("failed to close remote session: %w", msg.err))
+			return h, nil
+		}
+		h.setError(fmt.Errorf("closed '%s' on %s", msg.title, msg.remoteName))
+		return h, h.fetchRemoteSessions
+
+	case remoteSessionRestartedMsg:
+		if msg.err != nil {
+			h.setError(fmt.Errorf("failed to restart remote session: %w", msg.err))
+			return h, nil
+		}
+		h.setError(fmt.Errorf("restarted '%s' on %s", msg.title, msg.remoteName))
+		return h, h.fetchRemoteSessions
 
 	case MaintenanceCompleteMsg:
 		return h, func() tea.Msg {
@@ -3082,6 +3435,12 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear attach flag - we've returned from the attached session
 		h.isAttaching.Store(false) // Atomic store for thread safety
 		h.attachedSessID.Store("")
+		h.lastAttachReturn = time.Now()
+
+		// Refresh window cache and rebuild flat items to reflect window changes
+		// (user may have opened/closed tmux windows while attached)
+		tmux.RefreshSessionCache()
+		h.rebuildFlatItems()
 
 		// Trigger status update on attach return to reflect current state
 		// Acknowledgment was already done on attach (if session was waiting),
@@ -3132,6 +3491,8 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 
+		h.followAttachReturnCwd(msg)
+
 		// PERFORMANCE FIX: Skip save on attach return for 10 seconds
 		// Saving can also be blocking (JSON serialization + file write).
 		// Combine with periodic save instead of saving on every attach/detach.
@@ -3141,11 +3502,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case previewDebounceMsg:
 		// PERFORMANCE: Debounce period elapsed - check if this fetch is still relevant
-		// If user continued navigating, pendingPreviewID will have changed
+		// If user continued navigating, pendingPreviewKey will have changed
 		h.previewDebounceMu.Lock()
-		isPending := h.pendingPreviewID == msg.sessionID
+		isPending := h.pendingPreviewKey == msg.previewKey
 		if isPending {
-			h.pendingPreviewID = "" // Clear pending state
+			h.pendingPreviewKey = "" // Clear pending state
 		}
 		h.previewDebounceMu.Unlock()
 
@@ -3163,13 +3524,13 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Preview fetch
 			h.previewCacheMu.Lock()
-			needsPreviewFetch := h.previewFetchingID != inst.ID
+			needsPreviewFetch := h.previewFetchingID != msg.previewKey
 			if needsPreviewFetch {
-				h.previewFetchingID = inst.ID
+				h.previewFetchingID = msg.previewKey
 			}
 			h.previewCacheMu.Unlock()
 			if needsPreviewFetch {
-				cmds = append(cmds, h.fetchPreview(inst))
+				cmds = append(cmds, h.fetchPreview(inst, msg.previewKey, msg.windowIndex))
 			}
 
 			// Analytics fetch (for Claude/Gemini sessions with analytics enabled)
@@ -3256,8 +3617,8 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.previewCacheMu.Lock()
 		h.previewFetchingID = ""
 		if msg.err == nil {
-			h.previewCache[msg.sessionID] = msg.content
-			h.previewCacheTime[msg.sessionID] = time.Now()
+			h.previewCache[msg.previewKey] = msg.content
+			h.previewCacheTime[msg.previewKey] = time.Now()
 		}
 		h.previewCacheMu.Unlock()
 		return h, nil
@@ -3410,9 +3771,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.clearError()
 		}
 
-		// PERFORMANCE: Detect when navigation has settled (300ms since last up/down)
+		// PERFORMANCE: Detect when navigation has settled before re-enabling sync work.
 		// This allows background updates to resume after rapid navigation stops
-		const navigationSettleTime = 300 * time.Millisecond
+		const navigationSettleTime = 700 * time.Millisecond
 		if h.isNavigating && time.Since(h.lastNavigationTime) > navigationSettleTime {
 			h.isNavigating = false
 		}
@@ -3511,21 +3872,19 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Notification bar sync handled by background worker (syncNotificationsBackground)
 		// which runs even when TUI is paused during tea.Exec
 
-		// Fetch preview for currently selected session (if stale/missing and not fetching)
+		// Fetch preview for currently selected item (if stale/missing and not fetching)
 		// Cache expires after 2 seconds to show live terminal updates without excessive fetching
 		const previewCacheTTL = 2 * time.Second
 		var previewCmd tea.Cmd
-		h.instancesMu.RLock()
-		selected := h.getSelectedSession()
-		h.instancesMu.RUnlock()
-		if selected != nil {
+		selectedInst, selectedKey, selectedWinIdx := h.selectedPreviewTarget()
+		if selectedInst != nil {
 			h.previewCacheMu.Lock()
-			cachedTime, hasCached := h.previewCacheTime[selected.ID]
+			cachedTime, hasCached := h.previewCacheTime[selectedKey]
 			cacheExpired := !hasCached || time.Since(cachedTime) > previewCacheTTL
-			// Only fetch if cache is stale/missing AND not currently fetching this session
-			if cacheExpired && h.previewFetchingID != selected.ID {
-				h.previewFetchingID = selected.ID
-				previewCmd = h.fetchPreview(selected)
+			// Only fetch if cache is stale/missing AND not currently fetching this item
+			if cacheExpired && h.previewFetchingID != selectedKey {
+				h.previewFetchingID = selectedKey
+				previewCmd = h.fetchPreview(selectedInst, selectedKey, selectedWinIdx)
 			}
 			h.previewCacheMu.Unlock()
 		}
@@ -3544,6 +3903,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Track user activity for adaptive status updates
 		h.lastUserInputTime = time.Now()
 
+		// Handle jump mode input (before modals)
+		if h.jumpMode {
+			return h.handleJumpKey(msg)
+		}
+
 		// Handle setup wizard first (modal, blocks everything)
 		if h.setupWizard.IsVisible() {
 			var cmd tea.Cmd
@@ -3559,6 +3923,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.setupWizard.Hide()
 				// Reload config cache
 				_, _ = session.ReloadUserConfig()
+				h.reloadHotkeysFromConfig()
 				// Apply default tool to new dialog
 				if defaultTool := session.GetDefaultTool(); defaultTool != "" {
 					h.newDialog.SetDefaultTool(defaultTool)
@@ -3579,6 +3944,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					h.errTime = time.Now()
 				}
 				_, _ = session.ReloadUserConfig()
+				h.reloadHotkeysFromConfig()
 
 				// Apply theme changes live
 				h.stopThemeWatcher()
@@ -3651,6 +4017,10 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.bridgeStatusDialog.IsVisible() {
 			return h.handleBridgeStatusDialogKey(msg)
+		}
+
+		if h.notesEditing {
+			return h.handleNotesEditorKey(msg)
 		}
 
 		// Main view keys
@@ -3932,9 +4302,151 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return h, cmd
 }
 
+func (h *Home) beginNotesEditing(inst *session.Instance) {
+	if inst == nil {
+		return
+	}
+	h.notesEditing = true
+	h.notesEditingSessionID = inst.ID
+	h.notesEditor.SetValue(inst.Notes)
+	h.notesEditor.Focus()
+}
+
+func (h *Home) stopNotesEditing() {
+	h.notesEditing = false
+	h.notesEditingSessionID = ""
+	h.notesEditor.Blur()
+}
+
+func (h *Home) handleNotesEditorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	selected := h.getSelectedSession()
+	if selected == nil || selected.ID != h.notesEditingSessionID {
+		h.stopNotesEditing()
+		return h, nil
+	}
+
+	switch msg.String() {
+	case "esc":
+		h.stopNotesEditing()
+		return h, nil
+	case "ctrl+s":
+		notes := strings.TrimRight(h.notesEditor.Value(), "\n")
+		h.instancesMu.RLock()
+		inst := h.instanceByID[h.notesEditingSessionID]
+		h.instancesMu.RUnlock()
+		if inst != nil {
+			inst.Notes = notes
+			h.forceSaveInstances()
+		}
+		h.stopNotesEditing()
+		return h, nil
+	}
+
+	var cmd tea.Cmd
+	h.notesEditor, cmd = h.notesEditor.Update(msg)
+	return h, cmd
+}
+
+// overlayJumpHint places a badge-style hint label at the item name position.
+func (h *Home) overlayJumpHint(line string, hint string, buffer string, itemName string) string {
+	if hint == "" {
+		return line
+	}
+
+	offset := findNameOffset(line, itemName)
+	visibleLen := lipgloss.Width(line)
+	if visibleLen < offset+len(hint) {
+		return line
+	}
+
+	var hintRendered string
+	for i, ch := range hint {
+		s := string(ch)
+		if i < len(buffer) {
+			// Already typed: dimmed badge
+			hintRendered += lipgloss.NewStyle().Foreground(ColorBg).Background(ColorComment).Bold(true).Render(s)
+		} else {
+			// Remaining: bright yellow badge
+			hintRendered += lipgloss.NewStyle().Foreground(ColorBg).Background(ColorYellow).Bold(true).Render(s)
+		}
+	}
+
+	return replaceVisibleRange(line, offset, len(hint), hintRendered)
+}
+
+// jumpItemName returns the display name for an item, used to locate hint badge position.
+func jumpItemName(item session.Item) string {
+	switch item.Type {
+	case session.ItemTypeGroup:
+		if item.Group != nil {
+			return item.Group.Name
+		}
+	case session.ItemTypeSession:
+		if item.Session != nil {
+			return item.Session.Title
+		}
+	case session.ItemTypeWindow:
+		return item.WindowName
+	case session.ItemTypeRemoteGroup:
+		return "remotes/" + item.RemoteName
+	case session.ItemTypeRemoteSession:
+		if item.RemoteSession != nil {
+			return item.RemoteSession.Title
+		}
+	}
+	return ""
+}
+
+// handleJumpKey processes key input during jump mode.
+func (h *Home) handleJumpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch {
+	case key == "esc":
+		h.jumpMode = false
+		h.jumpBuffer = ""
+		return h, nil
+
+	case len(key) == 1 && key[0] >= 'a' && key[0] <= 'z':
+		h.jumpBuffer += key
+		hints := generateJumpHints(len(h.flatItems))
+		result := matchJumpHint(hints, h.jumpBuffer)
+
+		if result.matched {
+			h.cursor = result.index
+			h.syncViewport()
+			h.jumpMode = false
+			h.jumpBuffer = ""
+			// For sessions/windows/remotes: attach directly.
+			// For groups: just move cursor (user can press Enter to toggle).
+			item := h.flatItems[result.index]
+			if item.Type != session.ItemTypeGroup && item.Type != session.ItemTypeRemoteGroup {
+				return h.handleMainKey(tea.KeyMsg{Type: tea.KeyEnter})
+			}
+			return h, nil
+		}
+		if !result.isPrefix {
+			h.jumpMode = false
+			h.jumpBuffer = ""
+		}
+		return h, nil
+
+	default:
+		// Non-letter key — exit jump mode, pass key through
+		h.jumpMode = false
+		h.jumpBuffer = ""
+		return h.handleMainKey(msg)
+	}
+}
+
 // handleMainKey handles keys in main view
 func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	key := h.normalizeMainKey(msg.String())
+	if key == "" {
+		return h, nil
+	}
+
+	switch key {
 	case "q", "ctrl+c":
 		return h.tryQuit()
 
@@ -3957,14 +4469,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor > 0 {
 			h.cursor--
 			h.syncViewport()
-			// Track navigation for adaptive background updates
-			h.lastNavigationTime = time.Now()
-			h.isNavigating = true
+			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
 			// This prevents spawning tmux subprocess on every keystroke
-			if selected := h.getSelectedSession(); selected != nil {
-				return h, h.fetchPreviewDebounced(selected.ID)
-			}
+			return h, h.fetchSelectedPreview()
 		}
 		return h, nil
 
@@ -3972,18 +4480,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
 			h.syncViewport()
-			// Track navigation for adaptive background updates
-			h.lastNavigationTime = time.Now()
-			h.isNavigating = true
+			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
 			// This prevents spawning tmux subprocess on every keystroke
-			if selected := h.getSelectedSession(); selected != nil {
-				return h, h.fetchPreviewDebounced(selected.ID)
-			}
+			return h, h.fetchSelectedPreview()
 		}
 		return h, nil
 
-	// Vi-style pagination (#38) - half/full page scrolling
+		// Vi-style pagination (#38) - half/full page scrolling
 	case "ctrl+u": // Half page up
 		pageSize := h.getVisibleHeight() / 2
 		if pageSize < 1 {
@@ -3994,12 +4498,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.cursor = 0
 		}
 		h.syncViewport()
-		h.lastNavigationTime = time.Now()
-		h.isNavigating = true
-		if selected := h.getSelectedSession(); selected != nil {
-			return h, h.fetchPreviewDebounced(selected.ID)
-		}
-		return h, nil
+		h.markNavigationActivity()
+		return h, h.fetchSelectedPreview()
 
 	case "ctrl+d": // Half page down
 		pageSize := h.getVisibleHeight() / 2
@@ -4014,12 +4514,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.cursor = 0
 		}
 		h.syncViewport()
-		h.lastNavigationTime = time.Now()
-		h.isNavigating = true
-		if selected := h.getSelectedSession(); selected != nil {
-			return h, h.fetchPreviewDebounced(selected.ID)
-		}
-		return h, nil
+		h.markNavigationActivity()
+		return h, h.fetchSelectedPreview()
 
 	case "ctrl+b": // Full page up (backward)
 		pageSize := h.getVisibleHeight()
@@ -4031,12 +4527,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.cursor = 0
 		}
 		h.syncViewport()
-		h.lastNavigationTime = time.Now()
-		h.isNavigating = true
-		if selected := h.getSelectedSession(); selected != nil {
-			return h, h.fetchPreviewDebounced(selected.ID)
-		}
-		return h, nil
+		h.markNavigationActivity()
+		return h, h.fetchSelectedPreview()
 
 	case "ctrl+f": // Full page down (forward)
 		pageSize := h.getVisibleHeight()
@@ -4051,12 +4543,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.cursor = 0
 		}
 		h.syncViewport()
-		h.lastNavigationTime = time.Now()
-		h.isNavigating = true
-		if selected := h.getSelectedSession(); selected != nil {
-			return h, h.fetchPreviewDebounced(selected.ID)
-		}
-		return h, nil
+		h.markNavigationActivity()
+		return h, h.fetchSelectedPreview()
 
 	case "G": // Open global search (fall back to local search if index not available)
 		if h.globalSearchIndex != nil {
@@ -4111,6 +4599,40 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				h.saveGroupState()
+			} else if item.Type == session.ItemTypeWindow {
+				// Find parent session by WindowSessionID
+				var parentInst *session.Instance
+				h.instancesMu.RLock()
+				for _, inst := range h.instances {
+					if inst.ID == item.WindowSessionID {
+						parentInst = inst
+						break
+					}
+				}
+				h.instancesMu.RUnlock()
+
+				if parentInst != nil && parentInst.Exists() {
+					tmuxSess := parentInst.GetTmuxSession()
+					if tmuxSess != nil {
+						tmuxSess.EnsureConfigured()
+						parentInst.SyncSessionIDsToTmux()
+						parentInst.MarkAccessed()
+
+						if parentInst.GetStatusThreadSafe() == session.StatusWaiting {
+							tmuxSess.Acknowledge()
+							if db := statedb.GetGlobal(); db != nil {
+								_ = db.SetAcknowledged(parentInst.ID, true)
+							}
+						}
+
+						h.isAttaching.Store(true)
+						return h, tea.Exec(attachWindowCmd{session: tmuxSess, windowIndex: item.WindowIndex}, func(err error) tea.Msg {
+							h.isAttaching.Store(false)
+							parentInst.MarkAccessed()
+							return statusUpdateMsg{}
+						})
+					}
+				}
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
 				// Attach to remote session via SSH
 				return h, h.attachRemoteSession(item.RemoteName, item.RemoteSession.ID)
@@ -4119,7 +4641,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "tab", "l", "right":
-		// Expand/collapse group or expand if on session
+		// Expand/collapse group, or toggle session windows
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeGroup {
@@ -4133,12 +4655,17 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				h.saveGroupState()
+			} else if item.Type == session.ItemTypeSession && h.sessionHasWindows(item) {
+				sid := item.Session.ID
+				h.windowsCollapsed[sid] = !h.windowsCollapsed[sid]
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sid)
 			}
 		}
 		return h, nil
 
 	case "h", "left":
-		// Collapse group
+		// Collapse group, session windows, or navigate up
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			collapsed := false
@@ -4153,11 +4680,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				collapsed = true
+			} else if item.Type == session.ItemTypeWindow {
+				// Collapse parent session's windows and jump to it
+				sid := item.WindowSessionID
+				h.windowsCollapsed[sid] = true
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sid)
+				collapsed = false // no group state to save
+			} else if item.Type == session.ItemTypeSession && h.sessionHasWindows(item) && !h.windowsCollapsed[item.Session.ID] {
+				// Collapse this session's windows
+				h.windowsCollapsed[item.Session.ID] = true
+				h.rebuildFlatItems()
+				collapsed = false
 			} else if item.Type == session.ItemTypeSession {
 				// Move cursor to parent group
 				h.groupTree.CollapseGroup(item.Path)
 				h.rebuildFlatItems()
-				// Find the group in flatItems
 				for i, fi := range h.flatItems {
 					if fi.Type == session.ItemTypeGroup && fi.Path == item.Path {
 						h.cursor = i
@@ -4213,7 +4751,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil &&
-				(item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
+				(session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
 				h.mcpDialog.SetSize(h.width, h.height)
 				if err := h.mcpDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
 					h.setError(err)
@@ -4263,7 +4801,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil &&
-				item.Session.Tool == "claude" {
+				session.IsClaudeCompatible(item.Session.Tool) {
 				h.skillDialog.SetSize(h.width, h.height)
 				if err := h.skillDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
 					h.setError(err)
@@ -4323,11 +4861,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(h.flatItems) > 0 {
 				h.cursor = 0
 				h.syncViewport()
-				h.lastNavigationTime = time.Now()
-				h.isNavigating = true
-				if selected := h.getSelectedSession(); selected != nil {
-					return h, h.fetchPreviewDebounced(selected.ID)
-				}
+				h.markNavigationActivity()
+				return h, h.fetchSelectedPreview()
 			}
 			return h, nil
 		}
@@ -4446,6 +4981,15 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return h, nil
 			}
 		}
+
+		// Check if cursor is on a remote group/session — create on remote instead
+		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
+				return h, h.createRemoteSession(item.RemoteName)
+			}
+		}
+
 		// Collect unique project paths sorted by most recently accessed
 		type pathInfo struct {
 			path           string
@@ -4543,6 +5087,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "N":
+		// Check if cursor is on a remote group/session — create on remote instead
+		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
+				return h, h.createRemoteSession(item.RemoteName)
+			}
+		}
 		// Quick create: auto-generated name, smart defaults from group context
 		return h, h.quickCreateSession()
 
@@ -4552,8 +5103,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed())
+			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
+				h.confirmDialog.ShowDeleteRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			} else if item.Type == session.ItemTypeGroup && item.Path != session.DefaultGroupPath {
 				h.confirmDialog.ShowDeleteGroup(item.Path, item.Group.Name)
+			}
+		}
+		return h, nil
+
+	case "D":
+		// Close session process without deleting metadata from the list/storage.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				h.confirmDialog.ShowCloseSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed())
+			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
+				h.confirmDialog.ShowCloseRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			}
 		}
 		return h, nil
@@ -4582,44 +5147,75 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case " ":
+		if len(h.flatItems) > 0 {
+			h.jumpMode = true
+			h.jumpBuffer = ""
+		}
+		return h, nil
+
 	case "v":
 		// Toggle preview mode (cycle: both → output-only → analytics-only → both)
 		h.previewMode = (h.previewMode + 1) % 3
 		return h, nil
 
 	case "y":
-		// Toggle Gemini YOLO mode (requires restart)
+		// Toggle YOLO mode for Gemini or Codex sessions (requires restart)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
-			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.Tool == "gemini" {
+			if item.Type == session.ItemTypeSession && item.Session != nil {
 				inst := item.Session
-				// Determine current YOLO state
-				currentYolo := false
-				if inst.GeminiYoloMode != nil {
-					currentYolo = *inst.GeminiYoloMode
-				} else {
-					// Fall back to global config
-					userConfig, _ := session.LoadUserConfig()
-					if userConfig != nil {
-						currentYolo = userConfig.Gemini.YoloMode
+				toggled := false
+
+				switch inst.Tool {
+				case "gemini":
+					currentYolo := false
+					if inst.GeminiYoloMode != nil {
+						currentYolo = *inst.GeminiYoloMode
+					} else {
+						userConfig, _ := session.LoadUserConfig()
+						if userConfig != nil {
+							currentYolo = userConfig.Gemini.YoloMode
+						}
 					}
+					newYolo := !currentYolo
+					inst.GeminiYoloMode = &newYolo
+					toggled = true
+
+				case "codex":
+					currentYolo := false
+					opts := inst.GetCodexOptions()
+					if opts != nil && opts.YoloMode != nil {
+						currentYolo = *opts.YoloMode
+					} else {
+						userConfig, _ := session.LoadUserConfig()
+						if userConfig != nil {
+							currentYolo = userConfig.Codex.YoloMode
+						}
+					}
+					newYolo := !currentYolo
+					if opts == nil {
+						opts = &session.CodexOptions{}
+					}
+					opts.YoloMode = &newYolo
+					_ = inst.SetCodexOptions(opts)
+					toggled = true
 				}
-				// Toggle: set per-session override to opposite of current
-				newYolo := !currentYolo
-				inst.GeminiYoloMode = &newYolo
-				h.forceSaveInstances()
-				// If session is running, it needs restart to apply
-				if inst.GetStatusThreadSafe() == session.StatusRunning ||
-					inst.GetStatusThreadSafe() == session.StatusWaiting {
-					h.resumingSessions[inst.ID] = time.Now()
-					return h, h.restartSession(inst)
+
+				if toggled {
+					h.forceSaveInstances()
+					if inst.GetStatusThreadSafe() == session.StatusRunning ||
+						inst.GetStatusThreadSafe() == session.StatusWaiting {
+						h.resumingSessions[inst.ID] = time.Now()
+						return h, h.restartSession(inst)
+					}
 				}
 			}
 		}
 		return h, nil
 
 	case "R":
-		// Restart session (Shift+R - recreate tmux session with resume)
+		// Restart session (recreate tmux session with resume)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
@@ -4633,6 +5229,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.resumingSessions[item.Session.ID] = time.Now()
 					return h, h.restartSession(item.Session)
 				}
+			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
+				return h, h.restartRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			}
 		}
 		return h, nil
@@ -4663,6 +5261,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "e":
+		if config, _ := session.LoadUserConfig(); config != nil && !config.GetShowNotes() {
+			return h, nil
+		}
+		if h.getLayoutMode() == LayoutModeSingle {
+			h.setError(fmt.Errorf("notes editor is unavailable in single-column layout"))
+			return h, nil
+		}
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				h.beginNotesEditing(item.Session)
+			}
+		}
+		return h, nil
+
 	case "ctrl+g":
 		// Open Gemini model selection dialog (only for Gemini sessions)
 		if inst := h.getSelectedSession(); inst != nil && inst.Tool == "gemini" {
@@ -4682,7 +5296,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		inst := entry.instance
 		return h, func() tea.Msg {
 			err := inst.Restart()
-			return sessionRestoredMsg{instance: inst, err: err}
+			return sessionRestoredMsg{
+				instance: inst,
+				err:      err,
+				warning:  inst.ConsumeCodexRestartWarning(),
+			}
 		}
 
 	case "ctrl+r":
@@ -4703,7 +5321,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		// Quick jump to Nth root group (1-indexed)
-		targetNum := int(msg.String()[0] - '0') // Convert "1" -> 1, "2" -> 2, etc.
+		targetNum := int(key[0] - '0') // Convert "1" -> 1, "2" -> 2, etc.
 		h.jumpToRootGroup(targetNum)
 		return h, nil
 
@@ -4851,6 +5469,12 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.confirmDialog.Hide()
 					return h, h.deleteSession(inst)
 				}
+			case ConfirmCloseSession:
+				sessionID := h.confirmDialog.GetTargetID()
+				if inst := h.getInstanceByID(sessionID); inst != nil {
+					h.confirmDialog.Hide()
+					return h, h.closeSession(inst)
+				}
 			case ConfirmDeleteGroup:
 				groupPath := h.confirmDialog.GetTargetID()
 				h.groupTree.DeleteGroup(groupPath)
@@ -4863,6 +5487,18 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				hooks, repoDir, worktreePath, branch := h.confirmDialog.GetPendingCleanup()
 				h.confirmDialog.Hide()
 				return h, h.runWorktreeCleanupHooks(hooks, repoDir, worktreePath, branch)
+			case ConfirmDeleteRemoteSession:
+				sessionID := h.confirmDialog.GetTargetID()
+				remoteName := h.confirmDialog.GetRemoteName()
+				title := h.confirmDialog.targetName
+				h.confirmDialog.Hide()
+				return h, h.deleteRemoteSession(remoteName, sessionID, title)
+			case ConfirmCloseRemoteSession:
+				sessionID := h.confirmDialog.GetTargetID()
+				remoteName := h.confirmDialog.GetRemoteName()
+				title := h.confirmDialog.targetName
+				h.confirmDialog.Hide()
+				return h, h.closeRemoteSession(remoteName, sessionID, title)
 			}
 			h.confirmDialog.Hide()
 			return h, nil
@@ -5043,7 +5679,7 @@ func (h *Home) handleSkillDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			sessionID := h.skillDialog.GetSessionID()
 			targetInst := h.getInstanceByID(sessionID)
-			if targetInst != nil && targetInst.Tool == "claude" {
+			if targetInst != nil && session.IsClaudeCompatible(targetInst.Tool) {
 				h.skillDialog.Hide()
 				return h, h.restartSession(targetInst)
 			}
@@ -5433,6 +6069,8 @@ func (h *Home) saveUIState() {
 			if item.Session != nil {
 				state.CursorSessionID = item.Session.ID
 			}
+		case session.ItemTypeWindow:
+			state.CursorSessionID = item.WindowSessionID
 		case session.ItemTypeGroup:
 			state.CursorGroupPath = item.Path
 		}
@@ -5540,10 +6178,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			inst.WorktreeBranch = worktreeBranch
 		}
 
-		// Set Gemini YOLO mode if enabled (per-session override)
-		if geminiYoloMode && tool == "gemini" {
-			inst.GeminiYoloMode = &geminiYoloMode
-		}
+		applyCreateSessionToolOverrides(inst, tool, geminiYoloMode)
 
 		// Apply generic tool options (claude, codex, etc.)
 		if len(toolOptionsJSON) > 0 {
@@ -5580,6 +6215,15 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		}
 
 		return sessionCreatedMsg{instance: inst}
+	}
+}
+
+func applyCreateSessionToolOverrides(inst *session.Instance, tool string, geminiYoloMode bool) {
+	if inst == nil {
+		return
+	}
+	if tool == "gemini" {
+		inst.SetGeminiYoloMode(geminiYoloMode)
 	}
 }
 
@@ -5821,10 +6465,17 @@ type sessionDeletedMsg struct {
 	cleanupBranch        string
 }
 
+// sessionClosedMsg signals that a session process was closed without deleting metadata.
+type sessionClosedMsg struct {
+	sessionID string
+	killErr   error
+}
+
 // sessionRestoredMsg signals that an undo-delete restore completed
 type sessionRestoredMsg struct {
 	instance *session.Instance
 	err      error
+	warning  string
 }
 
 // deleteSession deletes a session
@@ -5884,10 +6535,20 @@ func (h *Home) runWorktreeCleanupHooks(hooks []git.WorktreeHook, repoDir, worktr
 	}
 }
 
+// closeSession stops a session process but keeps metadata in list/storage.
+func (h *Home) closeSession(inst *session.Instance) tea.Cmd {
+	id := inst.ID
+	return func() tea.Msg {
+		killErr := inst.Kill()
+		return sessionClosedMsg{sessionID: id, killErr: killErr}
+	}
+}
+
 // sessionRestartedMsg signals that a session was restarted.
 type sessionRestartedMsg struct {
 	sessionID string
 	err       error
+	warning   string
 }
 
 // mcpRestartedMsg signals that an MCP-triggered restart completed and should auto-attach
@@ -5921,7 +6582,119 @@ func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 
 		err := current.Restart()
 		mcpUILog.Debug("restart_session_result", slog.String("id", id), slog.Any("error", err))
-		return sessionRestartedMsg{sessionID: id, err: err}
+		return sessionRestartedMsg{
+			sessionID: id,
+			err:       err,
+			warning:   current.ConsumeCodexRestartWarning(),
+		}
+	}
+}
+
+type remoteSessionDeletedMsg struct {
+	remoteName string
+	sessionID  string
+	title      string
+	err        error
+}
+
+type remoteSessionClosedMsg struct {
+	remoteName string
+	sessionID  string
+	title      string
+	err        error
+}
+
+type remoteSessionRestartedMsg struct {
+	remoteName string
+	sessionID  string
+	title      string
+	err        error
+}
+
+// deleteRemoteSession deletes a remote session and refreshes the remote list.
+func (h *Home) deleteRemoteSession(remoteName, sessionID, title string) tea.Cmd {
+	return func() tea.Msg {
+		config, err := session.LoadUserConfig()
+		if err != nil || config == nil || config.Remotes == nil {
+			return remoteSessionDeletedMsg{
+				remoteName: remoteName,
+				sessionID:  sessionID,
+				title:      title,
+				err:        fmt.Errorf("failed to load remote config"),
+			}
+		}
+		rc, ok := config.Remotes[remoteName]
+		if !ok {
+			return remoteSessionDeletedMsg{
+				remoteName: remoteName,
+				sessionID:  sessionID,
+				title:      title,
+				err:        fmt.Errorf("remote '%s' not found", remoteName),
+			}
+		}
+		runner := session.NewSSHRunner(remoteName, rc)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		err = runner.DeleteSession(ctx, sessionID)
+		return remoteSessionDeletedMsg{remoteName: remoteName, sessionID: sessionID, title: title, err: err}
+	}
+}
+
+// closeRemoteSession stops a remote session process without deleting metadata.
+func (h *Home) closeRemoteSession(remoteName, sessionID, title string) tea.Cmd {
+	return func() tea.Msg {
+		config, err := session.LoadUserConfig()
+		if err != nil || config == nil || config.Remotes == nil {
+			return remoteSessionClosedMsg{
+				remoteName: remoteName,
+				sessionID:  sessionID,
+				title:      title,
+				err:        fmt.Errorf("failed to load remote config"),
+			}
+		}
+		rc, ok := config.Remotes[remoteName]
+		if !ok {
+			return remoteSessionClosedMsg{
+				remoteName: remoteName,
+				sessionID:  sessionID,
+				title:      title,
+				err:        fmt.Errorf("remote '%s' not found", remoteName),
+			}
+		}
+		runner := session.NewSSHRunner(remoteName, rc)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		err = runner.StopSession(ctx, sessionID)
+		return remoteSessionClosedMsg{remoteName: remoteName, sessionID: sessionID, title: title, err: err}
+	}
+}
+
+// restartRemoteSession restarts a remote session.
+func (h *Home) restartRemoteSession(remoteName, sessionID, title string) tea.Cmd {
+	return func() tea.Msg {
+		config, err := session.LoadUserConfig()
+		if err != nil || config == nil || config.Remotes == nil {
+			return remoteSessionRestartedMsg{
+				remoteName: remoteName,
+				sessionID:  sessionID,
+				title:      title,
+				err:        fmt.Errorf("failed to load remote config"),
+			}
+		}
+		rc, ok := config.Remotes[remoteName]
+		if !ok {
+			return remoteSessionRestartedMsg{
+				remoteName: remoteName,
+				sessionID:  sessionID,
+				title:      title,
+				err:        fmt.Errorf("remote '%s' not found", remoteName),
+			}
+		}
+		runner := session.NewSSHRunner(remoteName, rc)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err = runner.RestartSession(ctx, sessionID)
+		return remoteSessionRestartedMsg{remoteName: remoteName, sessionID: sessionID, title: title, err: err}
 	}
 }
 
@@ -5941,40 +6714,10 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	// (Deferred from load time for performance)
 	inst.SyncSessionIDsToTmux()
 
-	// Mark session as accessed (for recency-sorted path suggestions)
+	// Mark session as accessed (for recency-sorted path suggestions).
+	// Do not synchronously save here; saving on attach blocks transition and causes
+	// visible blank-screen delay before tmux attach starts.
 	inst.MarkAccessed()
-
-	// Skip saving during reload to avoid overwriting external changes
-	// THREAD-SAFE: Read isReloading under mutex
-	h.reloadMu.Lock()
-	reloading := h.isReloading
-	h.reloadMu.Unlock()
-	if !reloading && h.storage != nil {
-		// Take snapshot under lock for defensive programming
-		h.instancesMu.RLock()
-		instancesCopy := make([]*session.Instance, len(h.instances))
-		copy(instancesCopy, h.instances)
-		instanceCount := len(h.instances)
-		h.instancesMu.RUnlock()
-
-		// DEFENSIVE: Never save empty instances if storage has data
-		if instanceCount == 0 {
-			if info, err := os.Stat(h.storage.Path()); err == nil && info.Size() > 100 {
-				uiLog.Warn("save_attach_refusing_empty_overwrite", slog.Int64("file_bytes", info.Size()))
-				goto skipSave
-			}
-		}
-
-		groupTreeCopy := h.groupTree.ShallowCopyForSave()
-
-		// CRITICAL FIX: NotifySave MUST be called immediately before SaveWithGroups
-		// Previously it was called 18 lines earlier, creating a race window
-		if h.storageWatcher != nil {
-			h.storageWatcher.NotifySave()
-		}
-		_ = h.storage.SaveWithGroups(instancesCopy, groupTreeCopy)
-	}
-skipSave:
 
 	// Acknowledge on ATTACH (not detach) - but ONLY if session is waiting (yellow)
 	// This ensures:
@@ -5997,6 +6740,7 @@ skipSave:
 	// Use tea.Exec with a custom command that runs our Attach method
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
+	h.isAttaching.Store(true) // Prevent View() output only during actual attach transition
 	return tea.Exec(attachCmd{session: tmuxSess}, func(err error) tea.Msg {
 		// CRITICAL: Set isAttaching to false BEFORE returning the message
 		// This prevents a race condition where View() could be called with
@@ -6015,8 +6759,63 @@ skipSave:
 		// Acknowledgment happens on ATTACH (only if session was waiting/yellow).
 		// This lets running sessions stay green through attach/detach cycles.
 
-		return statusUpdateMsg{}
+		// Capture current pane CWD after attach returns for optional path follow.
+		currentWorkDir := strings.TrimSpace(tmuxSess.GetWorkDir())
+
+		return statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: currentWorkDir}
 	})
+}
+
+func (h *Home) followAttachReturnCwd(msg statusUpdateMsg) {
+	if msg.attachedSessionID == "" {
+		return
+	}
+
+	workDir := strings.TrimSpace(msg.attachedWorkDir)
+	if workDir == "" {
+		return
+	}
+
+	instanceSettings := session.GetInstanceSettings()
+	if !instanceSettings.GetFollowCwdOnAttach() {
+		return
+	}
+
+	workDir = filepath.Clean(workDir)
+	if !filepath.IsAbs(workDir) {
+		return
+	}
+
+	info, err := os.Stat(workDir)
+	if err != nil || !info.IsDir() {
+		return
+	}
+
+	h.instancesMu.RLock()
+	inst := h.instanceByID[msg.attachedSessionID]
+	h.instancesMu.RUnlock()
+	if inst == nil {
+		return
+	}
+
+	oldPath := strings.TrimSpace(inst.ProjectPath)
+	if oldPath == workDir {
+		return
+	}
+
+	inst.ProjectPath = workDir
+	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
+		tmuxSess.WorkDir = workDir
+	}
+	h.invalidatePreviewCache(inst.ID)
+	h.saveInstances()
+
+	uiLog.Info(
+		"attach_follow_cwd_updated",
+		slog.String("session_id", inst.ID),
+		slog.String("old_path", oldPath),
+		slog.String("new_path", workDir),
+	)
 }
 
 // attachCmd implements tea.ExecCommand for custom PTY attach
@@ -6035,6 +6834,64 @@ func (a attachCmd) Run() error {
 func (a attachCmd) SetStdin(r io.Reader)  {}
 func (a attachCmd) SetStdout(w io.Writer) {}
 func (a attachCmd) SetStderr(w io.Writer) {}
+
+// createRemoteSession creates a new session on a remote and auto-attaches to it.
+func (h *Home) createRemoteSession(remoteName string) tea.Cmd {
+	config, err := session.LoadUserConfig()
+	if err != nil || config == nil || config.Remotes == nil {
+		return func() tea.Msg {
+			return sessionCreatedMsg{err: fmt.Errorf("failed to load remote config")}
+		}
+	}
+	rc, ok := config.Remotes[remoteName]
+	if !ok {
+		return func() tea.Msg {
+			return sessionCreatedMsg{err: fmt.Errorf("remote '%s' not found", remoteName)}
+		}
+	}
+	runner := session.NewSSHRunner(remoteName, rc)
+	h.isAttaching.Store(true)
+	return tea.Exec(remoteCreateAndAttachCmd{runner: runner}, func(err error) tea.Msg {
+		h.isAttaching.Store(false)
+		if err != nil {
+			return sessionCreatedMsg{err: fmt.Errorf("failed to create remote session: %w", err)}
+		}
+		return statusUpdateMsg{}
+	})
+}
+
+// remoteCreateAndAttachCmd creates a session on the remote, then attaches to it.
+type remoteCreateAndAttachCmd struct {
+	runner *session.SSHRunner
+}
+
+func (r remoteCreateAndAttachCmd) Run() error {
+	ctx := context.Background()
+	sessionID, err := r.runner.CreateSession(ctx)
+	if err != nil {
+		return err
+	}
+	return r.runner.Attach(sessionID)
+}
+
+func (r remoteCreateAndAttachCmd) SetStdin(reader io.Reader)  {}
+func (r remoteCreateAndAttachCmd) SetStdout(writer io.Writer) {}
+func (r remoteCreateAndAttachCmd) SetStderr(writer io.Writer) {}
+
+// attachWindowCmd implements tea.ExecCommand for attaching to a specific tmux window
+type attachWindowCmd struct {
+	session     *tmux.Session
+	windowIndex int
+}
+
+func (a attachWindowCmd) Run() error {
+	ctx := context.Background()
+	return a.session.AttachWindow(ctx, a.windowIndex)
+}
+
+func (a attachWindowCmd) SetStdin(r io.Reader)  {}
+func (a attachWindowCmd) SetStdout(w io.Writer) {}
+func (a attachWindowCmd) SetStderr(w io.Writer) {}
 
 // attachRemoteSession attaches to a remote session via SSH, suspending the TUI.
 func (h *Home) attachRemoteSession(remoteName, sessionID string) tea.Cmd {
@@ -6106,20 +6963,23 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, errored int) {
 	}
 
 	// Compute counts
-	h.instancesMu.RLock()
-	for _, inst := range h.instances {
-		switch inst.GetStatusThreadSafe() {
+	snapshot := h.getSessionRenderSnapshot()
+	if snapshot == nil {
+		h.refreshSessionRenderSnapshot(nil)
+		snapshot = h.getSessionRenderSnapshot()
+	}
+	for _, state := range snapshot {
+		switch state.status {
 		case session.StatusRunning:
 			running++
 		case session.StatusWaiting:
 			waiting++
 		case session.StatusIdle:
 			idle++
-		case session.StatusError:
+		case session.StatusError, session.StatusStopped:
 			errored++
 		}
 	}
-	h.instancesMu.RUnlock()
 
 	// Cache results with timestamp
 	h.cachedStatusCounts.running = running
@@ -6557,19 +7417,7 @@ func (h *Home) View() string {
 	// CRITICAL: Use ensureExactHeight for robust, consistent output across all platforms
 	// This is the single source of truth for output height - guarantees exactly h.height lines
 	// regardless of component content, ANSI codes, or terminal differences
-	result := ensureExactHeight(b.String(), h.height)
-
-	// Apply width+height constraint via lipgloss.
-	// CRITICAL: Use MaxWidth (truncate) instead of Width (word-wrap).
-	// Width wraps long lines, which INCREASES the total line count beyond h.height.
-	// When View() returns more lines than the terminal height, Bubble Tea's renderer
-	// loses cursor position tracking, causing all subsequent frames to stack on top of
-	// each other — making the entire view appear duplicated 2-4x.
-	// MaxWidth truncates without adding lines. MaxHeight is a safety net.
-	return lipgloss.NewStyle().
-		MaxWidth(h.width).
-		MaxHeight(h.height).
-		Render(result)
+	return clampViewToViewport(b.String(), h.width, h.height)
 }
 
 // renderPanelTitle creates a styled section title with underline
@@ -6903,6 +7751,32 @@ func ensureExactHeight(content string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// clampViewToViewport hard-clamps the rendered frame to the terminal viewport.
+// This is the final safety net against any component returning an unexpected
+// extra line or a line that still exceeds the viewport width.
+func clampViewToViewport(content string, width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+
+	lines := strings.Split(content, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	} else if len(lines) < height {
+		for len(lines) < height {
+			lines = append(lines, "")
+		}
+	}
+
+	for i, line := range lines {
+		if ansi.StringWidth(line) > width {
+			lines[i] = ansi.Truncate(line, width, "")
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 // ensureExactWidth ensures each line in content has exactly the specified visual width.
 // This is essential for proper horizontal panel alignment in lipgloss.JoinHorizontal.
 //
@@ -7141,14 +8015,27 @@ func renderDetectedAtLine(b *strings.Builder, detectedAt time.Time) {
 }
 
 // renderForkHintLine renders the fork keyboard hint line.
-func renderForkHintLine(b *strings.Builder) {
+func (h *Home) renderForkHintLine(b *strings.Builder) {
+	quickForkKey := h.actionKey(hotkeyQuickFork)
+	forkWithOptionsKey := h.actionKey(hotkeyForkWithOptions)
+	if quickForkKey == "" && forkWithOptionsKey == "" {
+		return
+	}
+
 	hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
 	keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
 	b.WriteString(hintStyle.Render("Fork:    "))
-	b.WriteString(keyStyle.Render("f"))
-	b.WriteString(hintStyle.Render(" quick fork, "))
-	b.WriteString(keyStyle.Render("F"))
-	b.WriteString(hintStyle.Render(" fork with options"))
+	if quickForkKey != "" {
+		b.WriteString(keyStyle.Render(quickForkKey))
+		b.WriteString(hintStyle.Render(" quick fork"))
+	}
+	if quickForkKey != "" && forkWithOptionsKey != "" {
+		b.WriteString(hintStyle.Render(", "))
+	}
+	if forkWithOptionsKey != "" {
+		b.WriteString(keyStyle.Render(forkWithOptionsKey))
+		b.WriteString(hintStyle.Render(" fork with options"))
+	}
 	b.WriteString("\n")
 }
 
@@ -7252,7 +8139,17 @@ func (h *Home) renderHelpBarTiny() string {
 	border := borderStyle.Render(strings.Repeat("─", max(0, h.width)))
 
 	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	hint := hintStyle.Render("? for help")
+	helpKey := h.actionKey(hotkeyHelp)
+	var hint string
+	if h.jumpMode {
+		hint = lipgloss.NewStyle().Foreground(ColorYellow).Bold(true).Render("Jump: a-z/esc")
+	} else {
+		hintText := "Help key unbound"
+		if helpKey != "" {
+			hintText = helpKey + " for help"
+		}
+		hint = hintStyle.Render(hintText)
+	}
 
 	// Center the hint
 	padding := (h.width - lipgloss.Width(hint)) / 2
@@ -7276,41 +8173,89 @@ func (h *Home) renderHelpBarMinimal() string {
 		Bold(true)
 	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
 	sep := sepStyle.Render(" │ ")
+	renderKeys := func(keys ...string) string {
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			parts = append(parts, keyStyle.Render(key))
+		}
+		return strings.Join(parts, " ")
+	}
 
 	// Context-specific keys (left side)
 	var contextKeys string
-	if len(h.flatItems) == 0 {
-		contextKeys = keyStyle.Render(
-			"n",
-		) + " " + keyStyle.Render(
-			"N",
-		) + " " + keyStyle.Render(
-			"i",
-		) + " " + keyStyle.Render(
-			"g",
-		)
+	newKey := h.actionKey(hotkeyNewSession)
+	quickKey := h.actionKey(hotkeyQuickCreate)
+	importKey := h.actionKey(hotkeyImport)
+	groupKey := h.actionKey(hotkeyCreateGroup)
+	restartKey := h.actionKey(hotkeyRestart)
+	forkKey := h.actionKey(hotkeyQuickFork)
+	mcpKey := h.actionKey(hotkeyMCPManager)
+	skillsKey := h.actionKey(hotkeySkillsManager)
+	notesKey := h.actionKey(hotkeyEditNotes)
+	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
+		notesKey = ""
+	}
+	if h.jumpMode {
+		contextKeys = keyStyle.Render("a-z") + " " + keyStyle.Render("esc")
+		if h.jumpBuffer != "" {
+			bufStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
+			contextKeys = bufStyle.Render(h.jumpBuffer+"…") + " " + contextKeys
+		}
+	} else if len(h.flatItems) == 0 {
+		contextKeys = renderKeys(newKey, quickKey, importKey, groupKey)
 	} else if h.cursor < len(h.flatItems) {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
-			contextKeys = keyStyle.Render("⏎") + " " + keyStyle.Render("n") + " " + keyStyle.Render("N") + " " + keyStyle.Render("g")
+			contextKeys = renderKeys("⏎", newKey, quickKey, groupKey)
 		} else {
-			contextKeys = keyStyle.Render("⏎") + " " + keyStyle.Render("n") + " " + keyStyle.Render("N") + " " + keyStyle.Render("R")
+			contextKeys = renderKeys("⏎", newKey, quickKey, restartKey)
 			if item.Session != nil && item.Session.CanFork() {
-				contextKeys += " " + keyStyle.Render("f")
+				forkRendered := renderKeys(forkKey)
+				if forkRendered != "" {
+					contextKeys += " " + forkRendered
+				}
 			}
-			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
-				contextKeys += " " + keyStyle.Render("m")
+			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+				mcpRendered := renderKeys(mcpKey)
+				if mcpRendered != "" {
+					contextKeys += " " + mcpRendered
+				}
 			}
-			if item.Session != nil && item.Session.Tool == "claude" {
-				contextKeys += " " + keyStyle.Render("s")
+			if item.Session != nil && session.IsClaudeCompatible(item.Session.Tool) {
+				skillsRendered := renderKeys(skillsKey)
+				if skillsRendered != "" {
+					contextKeys += " " + skillsRendered
+				}
+			}
+			notesRendered := renderKeys(notesKey)
+			if notesRendered != "" {
+				contextKeys += " " + notesRendered
 			}
 		}
 	}
 
 	// Global keys (right side)
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	globalKeys := globalStyle.Render("↑↓") + " " + globalStyle.Render("/") + " " +
-		globalStyle.Render("S") + " " + globalStyle.Render("?") + " " + globalStyle.Render("q")
+	globalParts := []string{globalStyle.Render("↑↓")}
+	if key := h.actionKey(hotkeySearch); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	if key := h.actionKey(hotkeySettings); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	if key := h.actionKey(hotkeyHelp); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	if key := h.actionKey(hotkeyQuit); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	globalKeys := strings.Join(globalParts, " ")
+	if contextKeys == "" {
+		contextKeys = globalStyle.Render("No actions bound")
+	}
 
 	// Calculate padding
 	leftPart := contextKeys
@@ -7323,6 +8268,9 @@ func (h *Home) renderHelpBarMinimal() string {
 	}
 
 	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
+	if rightPart == "" {
+		content = leftPart
+	}
 
 	raw := lipgloss.JoinVertical(lipgloss.Left, border, content)
 	return lipgloss.NewStyle().MaxWidth(h.width).Render(raw)
@@ -7335,54 +8283,97 @@ func (h *Home) renderHelpBarCompact() string {
 
 	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
 	sep := sepStyle.Render(" │ ")
+	newQuickKey := joinHotkeyLabels(h.actionKey(hotkeyNewSession), h.actionKey(hotkeyQuickCreate))
 
 	// Abbreviated key+short desc
 	var contextHints []string
 	if len(h.flatItems) == 0 {
-		contextHints = []string{
-			h.helpKeyShort("n/N", "New"),
-			h.helpKeyShort("i", "Import"),
+		if newQuickKey != "" {
+			contextHints = append(contextHints, h.helpKeyShort(newQuickKey, "New"))
+		}
+		if key := h.actionKey(hotkeyImport); key != "" {
+			contextHints = append(contextHints, h.helpKeyShort(key, "Import"))
 		}
 	} else if h.cursor < len(h.flatItems) {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
-			contextHints = []string{
-				h.helpKeyShort("⏎", "Toggle"),
-				h.helpKeyShort("n/N", "New"),
+			contextHints = append(contextHints, h.helpKeyShort("⏎", "Toggle"))
+			if newQuickKey != "" {
+				contextHints = append(contextHints, h.helpKeyShort(newQuickKey, "New"))
 			}
 		} else {
-			contextHints = []string{
-				h.helpKeyShort("⏎", "Attach"),
-				h.helpKeyShort("n/N", "New"),
-				h.helpKeyShort("R", "Restart"),
+			contextHints = append(contextHints, h.helpKeyShort("⏎", "Attach"))
+			if newQuickKey != "" {
+				contextHints = append(contextHints, h.helpKeyShort(newQuickKey, "New"))
+			}
+			if key := h.actionKey(hotkeyRestart); key != "" {
+				contextHints = append(contextHints, h.helpKeyShort(key, "Restart"))
 			}
 			if item.Session != nil && item.Session.CanFork() {
-				contextHints = append(contextHints, h.helpKeyShort("f", "Fork"))
+				if key := h.actionKey(hotkeyQuickFork); key != "" {
+					contextHints = append(contextHints, h.helpKeyShort(key, "Fork"))
+				}
 			}
-			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
-				contextHints = append(contextHints, h.helpKeyShort("m", "MCP"))
-				contextHints = append(contextHints, h.helpKeyShort("v", h.previewModeShort()))
+			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+				if key := h.actionKey(hotkeyMCPManager); key != "" {
+					contextHints = append(contextHints, h.helpKeyShort(key, "MCP"))
+				}
+				if key := h.actionKey(hotkeyTogglePreview); key != "" {
+					contextHints = append(contextHints, h.helpKeyShort(key, h.previewModeShort()))
+				}
 			}
-			if item.Session != nil && item.Session.Tool == "claude" {
-				contextHints = append(contextHints, h.helpKeyShort("s", "Skills"))
+			if item.Session != nil && session.IsClaudeCompatible(item.Session.Tool) {
+				if key := h.actionKey(hotkeySkillsManager); key != "" {
+					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
+				}
 			}
-			contextHints = append(contextHints, h.helpKeyShort("c", "Copy"))
-			contextHints = append(contextHints, h.helpKeyShort("x", "Send"))
+			if key := h.actionKey(hotkeyCopyOutput); key != "" {
+				contextHints = append(contextHints, h.helpKeyShort(key, "Copy"))
+			}
+			if key := h.actionKey(hotkeySendOutput); key != "" {
+				contextHints = append(contextHints, h.helpKeyShort(key, "Send"))
+			}
+			if key := h.actionKey(hotkeyEditNotes); key != "" {
+				contextHints = append(contextHints, h.helpKeyShort(key, "Notes"))
+			}
 		}
 	}
 
 	// Show undo hint when undo stack is non-empty
 	if len(h.undoStack) > 0 {
-		contextHints = append(contextHints, h.helpKeyShort("^Z", "Undo"))
+		if key := h.actionKey(hotkeyUndoDelete); key != "" {
+			contextHints = append(contextHints, h.helpKeyShort(key, "Undo"))
+		}
+	}
+
+	// Jump mode overrides all context hints
+	if h.jumpMode {
+		contextHints = []string{
+			h.helpKeyShort("a-z", "Hint"),
+			h.helpKeyShort("esc", "Cancel"),
+		}
+		if h.jumpBuffer != "" {
+			bufStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
+			contextHints = append([]string{bufStyle.Render(h.jumpBuffer + "…")}, contextHints...)
+		}
 	}
 
 	// Global hints (abbreviated)
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	globalHints := globalStyle.Render("↑↓ Nav") + " " +
-		globalStyle.Render("/") + " " +
-		globalStyle.Render("S") + " " +
-		globalStyle.Render("?") + " " +
-		globalStyle.Render("q")
+	globalParts := []string{globalStyle.Render("↑↓ Nav")}
+	if key := h.actionKey(hotkeySearch); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	if key := h.actionKey(hotkeySettings); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	if key := h.actionKey(hotkeyHelp); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	if key := h.actionKey(hotkeyQuit); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key))
+	}
+	globalHints := strings.Join(globalParts, " ")
 
 	leftPart := strings.Join(contextHints, " ")
 	rightPart := globalHints
@@ -7426,6 +8417,25 @@ func (h *Home) renderHelpBarFull() string {
 	// Separator style for grouping related actions
 	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
 	sep := sepStyle.Render(" │ ")
+	newQuickKey := joinHotkeyLabels(h.actionKey(hotkeyNewSession), h.actionKey(hotkeyQuickCreate))
+	renameKey := h.actionKey(hotkeyRename)
+	restartKey := h.actionKey(hotkeyRestart)
+	deleteKey := h.actionKey(hotkeyDelete)
+	closeKey := h.actionKey(hotkeyCloseSession)
+	groupKey := h.actionKey(hotkeyCreateGroup)
+	moveKey := h.actionKey(hotkeyMoveToGroup)
+	mcpKey := h.actionKey(hotkeyMCPManager)
+	skillsKey := h.actionKey(hotkeySkillsManager)
+	previewKey := h.actionKey(hotkeyTogglePreview)
+	forkKeys := joinHotkeyLabels(h.actionKey(hotkeyQuickFork), h.actionKey(hotkeyForkWithOptions))
+	copyKey := h.actionKey(hotkeyCopyOutput)
+	sendKey := h.actionKey(hotkeySendOutput)
+	execShellKey := h.actionKey(hotkeyExecShell)
+	notesKey := h.actionKey(hotkeyEditNotes)
+	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
+		notesKey = ""
+	}
+	undoKey := h.actionKey(hotkeyUndoDelete)
 
 	// Determine context-specific hints grouped by action type
 	var primaryHints []string   // Main actions (attach, toggle, etc.)
@@ -7434,60 +8444,112 @@ func (h *Home) renderHelpBarFull() string {
 
 	if len(h.flatItems) == 0 {
 		contextTitle = "Empty"
-		primaryHints = []string{
-			h.helpKey("n/N", "New/Quick"),
-			h.helpKey("i", "Import"),
-			h.helpKey("g", "Group"),
+		if newQuickKey != "" {
+			primaryHints = append(primaryHints, h.helpKey(newQuickKey, "New/Quick"))
+		}
+		if key := h.actionKey(hotkeyImport); key != "" {
+			primaryHints = append(primaryHints, h.helpKey(key, "Import"))
+		}
+		if groupKey != "" {
+			primaryHints = append(primaryHints, h.helpKey(groupKey, "Group"))
 		}
 	} else if h.cursor < len(h.flatItems) {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
 			contextTitle = "Group"
-			primaryHints = []string{
-				h.helpKey("Tab", "Toggle"),
-				h.helpKey("n/N", "New/Quick"),
-				h.helpKey("g", "Group"),
+			primaryHints = append(primaryHints, h.helpKey("Tab", "Toggle"))
+			if newQuickKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(newQuickKey, "New/Quick"))
 			}
-			secondaryHints = []string{
-				h.helpKey("r", "Rename"),
-				h.helpKey("d", "Delete"),
+			if groupKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(groupKey, "Group"))
+			}
+			if renameKey != "" {
+				secondaryHints = append(secondaryHints, h.helpKey(renameKey, "Rename"))
+			}
+			if deleteKey != "" {
+				secondaryHints = append(secondaryHints, h.helpKey(deleteKey, "Delete"))
 			}
 		} else {
 			contextTitle = "Session"
-			primaryHints = []string{
-				h.helpKey("Enter", "Attach"),
-				h.helpKey("n/N", "New/Quick"),
-				h.helpKey("g", "Group"),
-				h.helpKey("R", "Restart"),
+			primaryHints = append(primaryHints, h.helpKey("Enter", "Attach"))
+			if newQuickKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(newQuickKey, "New/Quick"))
+			}
+			if groupKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(groupKey, "Group"))
+			}
+			if restartKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(restartKey, "Restart"))
 			}
 			// Only show fork hints if session has a valid Claude session ID
 			if item.Session != nil && item.Session.CanFork() {
-				primaryHints = append(primaryHints, h.helpKey("f/F", "Fork"))
+				if forkKeys != "" {
+					primaryHints = append(primaryHints, h.helpKey(forkKeys, "Fork"))
+				}
 			}
 			// Show MCP Manager and preview mode toggle for Claude and Gemini sessions
-			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
-				primaryHints = append(primaryHints, h.helpKey("m", "MCP"))
-				primaryHints = append(primaryHints, h.helpKey("v", h.previewModeShort()))
+			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+				if mcpKey != "" {
+					primaryHints = append(primaryHints, h.helpKey(mcpKey, "MCP"))
+				}
+				if previewKey != "" {
+					primaryHints = append(primaryHints, h.helpKey(previewKey, h.previewModeShort()))
+				}
 			}
-			if item.Session != nil && item.Session.Tool == "claude" {
-				primaryHints = append(primaryHints, h.helpKey("s", "Skills"))
+			if item.Session != nil && session.IsClaudeCompatible(item.Session.Tool) {
+				if skillsKey != "" {
+					primaryHints = append(primaryHints, h.helpKey(skillsKey, "Skills"))
+				}
 			}
 			if item.Session != nil && item.Session.IsSandboxed() {
-				primaryHints = append(primaryHints, h.helpKey("E", "Exec"))
+				if execShellKey != "" {
+					primaryHints = append(primaryHints, h.helpKey(execShellKey, "Exec"))
+				}
 			}
-			primaryHints = append(primaryHints, h.helpKey("c", "Copy"))
-			primaryHints = append(primaryHints, h.helpKey("x", "Send"))
-			secondaryHints = []string{
-				h.helpKey("r", "Rename"),
-				h.helpKey("M", "Move"),
-				h.helpKey("d", "Delete"),
+			if copyKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(copyKey, "Copy"))
+			}
+			if sendKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(sendKey, "Send"))
+			}
+			if notesKey != "" {
+				primaryHints = append(primaryHints, h.helpKey(notesKey, "Notes"))
+			}
+			if renameKey != "" {
+				secondaryHints = append(secondaryHints, h.helpKey(renameKey, "Rename"))
+			}
+			if moveKey != "" {
+				secondaryHints = append(secondaryHints, h.helpKey(moveKey, "Move"))
+			}
+			if deleteKey != "" {
+				secondaryHints = append(secondaryHints, h.helpKey(deleteKey, "Delete"))
+			}
+			if closeKey != "" {
+				secondaryHints = append(secondaryHints, h.helpKey(closeKey, "Close"))
 			}
 		}
 	}
 
 	// Show undo hint when undo stack is non-empty
 	if len(h.undoStack) > 0 {
-		secondaryHints = append(secondaryHints, h.helpKey("^Z", "Undo"))
+		if undoKey != "" {
+			secondaryHints = append(secondaryHints, h.helpKey(undoKey, "Undo"))
+		}
+	}
+
+	// Jump mode overrides all context hints
+	if h.jumpMode {
+		contextTitle = "Jump"
+		primaryHints = []string{
+			h.helpKey("a-z", "Type hint"),
+			h.helpKey("esc", "Cancel"),
+		}
+		if h.jumpBuffer != "" {
+			bufStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
+			primaryHints = append([]string{bufStyle.Render(h.jumpBuffer + "…")}, primaryHints...)
+		}
+		secondaryHints = nil
 	}
 
 	// Top border
@@ -7521,9 +8583,21 @@ func (h *Home) renderHelpBarFull() string {
 
 	// Global shortcuts (right side) - more compact with separators
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	globalHints := globalStyle.Render("↑↓ Nav") + sep +
-		globalStyle.Render("/ Search  G Global") + sep +
-		globalStyle.Render("S Settings  ? Help  q Quit")
+	globalParts := []string{globalStyle.Render("↑↓ Nav")}
+	if key := h.actionKey(hotkeySearch); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key+" Search"))
+	}
+	globalParts = append(globalParts, globalStyle.Render("G Global"))
+	if key := h.actionKey(hotkeySettings); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key+" Settings"))
+	}
+	if key := h.actionKey(hotkeyHelp); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key+" Help"))
+	}
+	if key := h.actionKey(hotkeyQuit); key != "" {
+		globalParts = append(globalParts, globalStyle.Render(key+" Quit"))
+	}
+	globalHints := strings.Join(globalParts, sep)
 
 	// Calculate spacing between left (context) and right (global) portions
 	leftPart := contextLabel + " " + shortcutsLine
@@ -7571,15 +8645,25 @@ func (h *Home) renderSessionList(width, height int) string {
 			contentHeight = 5
 		}
 
+		hints := make([]string, 0, 3)
+		if key := h.actionKey(hotkeyNewSession); key != "" {
+			hints = append(hints, fmt.Sprintf("Press %s to create a new session", key))
+		}
+		if key := h.actionKey(hotkeyImport); key != "" {
+			hints = append(hints, fmt.Sprintf("Press %s to import existing tmux sessions", key))
+		}
+		if key := h.actionKey(hotkeyCreateGroup); key != "" {
+			hints = append(hints, fmt.Sprintf("Press %s to create a group", key))
+		}
+		if len(hints) == 0 {
+			hints = append(hints, "Create or import sessions to get started")
+		}
+
 		emptyContent := renderEmptyStateResponsive(EmptyStateConfig{
 			Icon:     "⬡",
 			Title:    "No Sessions Yet",
 			Subtitle: "Get started by creating your first session",
-			Hints: []string{
-				"Press n to create a new session",
-				"Press i to import existing tmux sessions",
-				"Press g to create a group",
-			},
+			Hints:    hints,
 		}, contentWidth, contentHeight)
 
 		return lipgloss.NewStyle().
@@ -7602,9 +8686,40 @@ func (h *Home) renderSessionList(width, height int) string {
 		maxVisible-- // Account for the indicator line
 	}
 
+	snapshot := h.getSessionRenderSnapshot()
+	groupStats := h.buildGroupRenderStats(snapshot)
+	var jumpHints []string
+	if h.jumpMode {
+		jumpHints = generateJumpHints(len(h.flatItems))
+	}
+
 	for i := h.viewOffset; i < len(h.flatItems) && visibleCount < maxVisible; i++ {
 		item := h.flatItems[i]
-		h.renderItem(&b, item, i == h.cursor, i)
+		if h.jumpMode && i < len(jumpHints) {
+			// Render item to temp buffer, then overlay hint badge at name position
+			var itemBuf strings.Builder
+			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot)
+			raw := itemBuf.String()
+			hint := jumpHints[i]
+			isMatch := h.jumpBuffer == "" || strings.HasPrefix(hint, h.jumpBuffer)
+
+			if isMatch {
+				// Get the display name for this item type
+				itemName := jumpItemName(item)
+				// Overlay hint on the first line, preserve rest exactly
+				if idx := strings.Index(raw, "\n"); idx >= 0 {
+					b.WriteString(h.overlayJumpHint(raw[:idx], hint, h.jumpBuffer, itemName))
+					b.WriteString(raw[idx:]) // includes \n and any subsequent lines
+				} else {
+					b.WriteString(h.overlayJumpHint(raw, hint, h.jumpBuffer, itemName))
+				}
+			} else {
+				// Non-matching: render normally (no dimming to preserve layout)
+				b.WriteString(raw)
+			}
+		} else {
+			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot)
+		}
 		visibleCount++
 	}
 
@@ -7618,15 +8733,79 @@ func (h *Home) renderSessionList(width, height int) string {
 	return b.String()
 }
 
+type groupRenderStats struct {
+	sessionCount int
+	running      int
+	waiting      int
+}
+
+func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map[string]groupRenderStats {
+	stats := make(map[string]groupRenderStats)
+	if h.groupTree == nil {
+		return stats
+	}
+
+	for path, g := range h.groupTree.Groups {
+		if g == nil {
+			continue
+		}
+
+		directSessions := len(g.Sessions)
+		directRunning := 0
+		directWaiting := 0
+		for _, sess := range g.Sessions {
+			state, ok := snapshot[sess.ID]
+			status := sess.Status
+			if ok {
+				status = state.status
+			}
+			switch status {
+			case session.StatusRunning:
+				directRunning++
+			case session.StatusWaiting:
+				directWaiting++
+			}
+		}
+
+		// Add direct totals to this group and all ancestors once,
+		// avoiding repeated recursive scans per rendered row.
+		ancestor := path
+		for ancestor != "" {
+			entry := stats[ancestor]
+			entry.sessionCount += directSessions
+			entry.running += directRunning
+			entry.waiting += directWaiting
+			stats[ancestor] = entry
+
+			idx := strings.LastIndex(ancestor, "/")
+			if idx == -1 {
+				break
+			}
+			ancestor = ancestor[:idx]
+		}
+	}
+
+	return stats
+}
+
 // renderItem renders a single item (group, notes, or session) for the left panel
-func (h *Home) renderItem(b *strings.Builder, item session.Item, selected bool, itemIndex int) {
+func (h *Home) renderItem(
+	b *strings.Builder,
+	item session.Item,
+	selected bool,
+	itemIndex int,
+	groupStats map[string]groupRenderStats,
+	snapshot map[string]sessionRenderState,
+) {
 	switch item.Type {
 	case session.ItemTypeGroup:
-		h.renderGroupItem(b, item, selected, itemIndex)
+		h.renderGroupItem(b, item, selected, itemIndex, groupStats)
 	case session.ItemTypeNotes:
 		h.renderNotesItem(b, item, selected)
 	case session.ItemTypeSession:
-		h.renderSessionItem(b, item, selected)
+		h.renderSessionItem(b, item, selected, snapshot)
+	case session.ItemTypeWindow:
+		h.renderWindowItem(b, item, selected)
 	case session.ItemTypeRemoteGroup:
 		h.renderRemoteGroupItem(b, item, selected)
 	case session.ItemTypeRemoteSession:
@@ -7636,7 +8815,13 @@ func (h *Home) renderItem(b *strings.Builder, item session.Item, selected bool, 
 
 // renderGroupItem renders a group header
 // PERFORMANCE: Uses cached styles from styles.go to avoid allocations
-func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected bool, itemIndex int) {
+func (h *Home) renderGroupItem(
+	b *strings.Builder,
+	item session.Item,
+	selected bool,
+	itemIndex int,
+	groupStats map[string]groupRenderStats,
+) {
 	group := item.Group
 
 	// Calculate indentation based on nesting level (no tree lines, just spaces)
@@ -7676,33 +8861,16 @@ func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected b
 		countStyle = GroupCountSelStyle
 	}
 
-	// Use recursive count to include sessions in subgroups (Issue #48)
-	sessionCount := h.groupTree.SessionCountForGroup(group.Path)
-	countStr := countStyle.Render(fmt.Sprintf(" (%d)", sessionCount))
-
-	// Status indicators (compact, on same line) using cached styles
-	// Also count recursively for subgroups
-	running := 0
-	waiting := 0
-	for path, g := range h.groupTree.Groups {
-		if path == group.Path || strings.HasPrefix(path, group.Path+"/") {
-			for _, sess := range g.Sessions {
-				switch sess.Status {
-				case session.StatusRunning:
-					running++
-				case session.StatusWaiting:
-					waiting++
-				}
-			}
-		}
-	}
+	// Use precomputed recursive stats (group + descendants) for this render pass.
+	stats := groupStats[group.Path]
+	countStr := countStyle.Render(fmt.Sprintf(" (%d)", stats.sessionCount))
 
 	statusStr := ""
-	if running > 0 {
-		statusStr += " " + GroupStatusRunning.Render(fmt.Sprintf("● %d", running))
+	if stats.running > 0 {
+		statusStr += " " + GroupStatusRunning.Render(fmt.Sprintf("● %d", stats.running))
 	}
-	if waiting > 0 {
-		statusStr += " " + GroupStatusWaiting.Render(fmt.Sprintf("◐ %d", waiting))
+	if stats.waiting > 0 {
+		statusStr += " " + GroupStatusWaiting.Render(fmt.Sprintf("◐ %d", stats.waiting))
 	}
 
 	// Build the row: [indent][hotkey][expand] [name](count) [status]
@@ -7766,12 +8934,21 @@ const (
 
 // renderSessionItem renders a single session item for the left panel
 // PERFORMANCE: Uses cached styles from styles.go to avoid allocations
-func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected bool) {
+func (h *Home) renderSessionItem(
+	b *strings.Builder,
+	item session.Item,
+	selected bool,
+	snapshot map[string]sessionRenderState,
+) {
 	inst := item.Session
 
-	// Snapshot status and tool under read lock to avoid races with background worker
-	instStatus := inst.GetStatusThreadSafe()
-	instTool := inst.GetToolThreadSafe()
+	// Read status/tool from snapshot so render path stays lock-light during key-repeat.
+	instState, ok := snapshot[inst.ID]
+	if !ok {
+		instState = h.getSessionRenderState(inst)
+	}
+	instStatus := instState.status
+	instTool := instState.tool
 
 	// Tree style for connectors - Use ColorText for clear visibility of box-drawing characters
 	treeStyle := TreeConnectorStyle
@@ -7826,6 +9003,9 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 	case session.StatusError:
 		statusIcon = "✕"
 		statusStyle = SessionStatusError
+	case session.StatusStopped:
+		statusIcon = "■"
+		statusStyle = SessionStatusStopped
 	default:
 		statusIcon = "○"
 		statusStyle = SessionStatusIdle
@@ -7870,9 +9050,17 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 	title := titleStyle.Render(inst.Title)
 	tool := toolStyle.Render(" " + instTool)
 
-	// YOLO badge for Gemini sessions with YOLO mode enabled
+	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled
 	yoloBadge := ""
+	showYolo := false
 	if instTool == "gemini" && inst.GeminiYoloMode != nil && *inst.GeminiYoloMode {
+		showYolo = true
+	} else if instTool == "codex" {
+		if opts := inst.GetCodexOptions(); opts != nil && opts.YoloMode != nil && *opts.YoloMode {
+			showYolo = true
+		}
+	}
+	if showYolo {
 		yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
 		if selected {
 			yoloStyle = SessionStatusSelStyle
@@ -7918,14 +9106,27 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 		sshBadge = sshStyle.Render(" [ssh:" + host + "]")
 	}
 
-	// Build row: [baseIndent][selection][tree][status] [title] [tool] [yolo] [worktree] [sandbox] [ssh]
-	// Format: " ├─ ● session-name tool" or "▶└─ ● session-name tool"
-	// Sub-sessions get extra indent: "   ├─◐ sub-session tool"
+	// Window expand/collapse chevron for sessions with 2+ windows
+	windowChevron := " " // space placeholder to keep status icons aligned
+	if h.sessionHasWindows(item) {
+		chevronChar := "▾"
+		if h.windowsCollapsed[inst.ID] {
+			chevronChar = "▸"
+		}
+		chevronStyle := TreeConnectorStyle
+		if selected {
+			chevronStyle = TreeConnectorSelStyle
+		}
+		windowChevron = chevronStyle.Render(chevronChar)
+	}
+
+	// Build row: [baseIndent][selection][tree][chevron][status] [title] [tool] [yolo] [worktree] [sandbox] [ssh]
 	row := fmt.Sprintf(
-		"%s%s%s %s %s%s%s%s%s%s",
+		"%s%s%s%s%s %s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
+		windowChevron,
 		status,
 		title,
 		tool,
@@ -7933,6 +9134,72 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 		worktreeBadge,
 		sandboxBadge,
 		sshBadge,
+	)
+	b.WriteString(row)
+	b.WriteString("\n")
+}
+
+// renderWindowItem renders a single window item (child of a session) for the left panel
+func (h *Home) renderWindowItem(b *strings.Builder, item session.Item, selected bool) {
+	treeStyle := TreeConnectorStyle
+
+	// Base indent — windows are children of sessions.
+	// Show │ continuation line at the parent session's level when it's not the
+	// last item in the group. Extra space after │ so window ├─ aligns under
+	// the parent session's ○ status bullet (position 4).
+	baseIndent := ""
+	if item.Level > 1 {
+		groupIndent := strings.Repeat(treeEmpty, item.Level-2)
+		if item.ParentIsLastInGroup {
+			baseIndent = groupIndent + "   " // No continuation needed
+		} else {
+			baseIndent = groupIndent + " " + treeStyle.Render("│") + " "
+		}
+	}
+
+	// Tree connector
+	treeConnector := subBranch
+	if item.IsLastWindow {
+		treeConnector = subLast
+	}
+
+	// Selection
+	selectionPrefix := " "
+	nameStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	indexStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	if selected {
+		selectionPrefix = SessionSelectionPrefix.Render("▶")
+		nameStyle = SessionTitleSelStyle
+		indexStyle = SessionStatusSelStyle
+		treeStyle = TreeConnectorSelStyle
+		// Rebuild baseIndent with selection styling
+		if item.Level > 1 && !item.ParentIsLastInGroup {
+			groupIndent := strings.Repeat(treeEmpty, max(0, item.Level-2))
+			baseIndent = groupIndent + " " + treeStyle.Render("│") + " "
+		}
+	}
+
+	winLabel := indexStyle.Render(fmt.Sprintf("[%d]", item.WindowIndex))
+	winName := nameStyle.Render(" " + item.WindowName)
+
+	// Tool badge (if detected)
+	toolBadge := ""
+	if item.WindowTool != "" {
+		toolStyle := GetToolStyle(item.WindowTool)
+		if selected {
+			toolStyle = SessionStatusSelStyle
+		}
+		toolBadge = toolStyle.Render(" " + item.WindowTool)
+	}
+
+	row := fmt.Sprintf(
+		"%s%s%s %s%s%s",
+		baseIndent,
+		selectionPrefix,
+		treeStyle.Render(treeConnector),
+		winLabel,
+		winName,
+		toolBadge,
 	)
 	b.WriteString(row)
 	b.WriteString("\n")
@@ -8399,14 +9666,21 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
 		// Show different message when there are no sessions vs just no selection
 		if len(h.flatItems) == 0 {
+			hints := make([]string, 0, 2)
+			if key := h.actionKey(hotkeyNewSession); key != "" {
+				hints = append(hints, fmt.Sprintf("Press %s to create your first session", key))
+			}
+			if key := h.actionKey(hotkeyImport); key != "" {
+				hints = append(hints, fmt.Sprintf("Press %s to import tmux sessions", key))
+			}
+			if len(hints) == 0 {
+				hints = append(hints, "Create or import sessions to get started")
+			}
 			return renderEmptyStateResponsive(EmptyStateConfig{
 				Icon:     "✦",
 				Title:    "Ready to Go",
 				Subtitle: "Your workspace is set up",
-				Hints: []string{
-					"Press n to create your first session",
-					"Press i to import tmux sessions",
-				},
+				Hints:    hints,
 			}, width, height)
 		}
 		return renderEmptyStateResponsive(EmptyStateConfig{
@@ -8433,8 +9707,27 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		return h.renderRemotePreview(item, width, height)
 	}
 
+	// Window items: resolve parent session for preview
+	if item.Type == session.ItemTypeWindow {
+		parentInst := h.getInstanceByID(item.WindowSessionID)
+		if parentInst == nil {
+			return renderEmptyStateResponsive(EmptyStateConfig{
+				Icon:     "◇",
+				Title:    fmt.Sprintf("Window %d: %s", item.WindowIndex, item.WindowName),
+				Subtitle: "Parent session not found",
+			}, width, height)
+		}
+		item.Session = parentInst
+	}
+
 	// Session preview
 	selected := item.Session
+
+	// Compute preview cache key (window-aware)
+	pvKey := selected.ID
+	if item.Type == session.ItemTypeWindow {
+		pvKey = previewCacheKey(selected.ID, item.WindowIndex)
+	}
 
 	// Session info header box
 	statusIcon := "○"
@@ -8449,6 +9742,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	case session.StatusError:
 		statusIcon = "✕"
 		statusColor = ColorRed
+	case session.StatusStopped:
+		statusIcon = "■"
+		statusColor = ColorTextDim
 	}
 
 	// Header with session name and status
@@ -8545,14 +9841,16 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n")
 
 		// Finish hint
-		b.WriteString(wtHintStyle.Render("Finish:  "))
-		b.WriteString(wtKeyStyle.Render("W"))
-		b.WriteString(wtHintStyle.Render(" merge + cleanup"))
-		b.WriteString("\n")
+		if finishKey := h.actionKey(hotkeyWorktreeFinish); finishKey != "" {
+			b.WriteString(wtHintStyle.Render("Finish:  "))
+			b.WriteString(wtKeyStyle.Render(finishKey))
+			b.WriteString(wtHintStyle.Render(" merge + cleanup"))
+			b.WriteString("\n")
+		}
 	}
 
 	// Claude-specific info (session ID and MCPs)
-	if selected.Tool == "claude" {
+	if session.IsClaudeCompatible(selected.Tool) {
 		// Section divider for Claude info
 		claudeHeader := renderSectionDivider("Claude", width-4)
 		b.WriteString(claudeHeader)
@@ -8722,14 +10020,25 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 		// Fork hint when session can be forked
 		if selected.CanFork() {
-			hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
-			keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
-			b.WriteString(hintStyle.Render("Fork:    "))
-			b.WriteString(keyStyle.Render("f"))
-			b.WriteString(hintStyle.Render(" quick fork, "))
-			b.WriteString(keyStyle.Render("F"))
-			b.WriteString(hintStyle.Render(" fork with options"))
-			b.WriteString("\n")
+			quickForkKey := h.actionKey(hotkeyQuickFork)
+			forkWithOptionsKey := h.actionKey(hotkeyForkWithOptions)
+			if quickForkKey != "" || forkWithOptionsKey != "" {
+				hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+				keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+				b.WriteString(hintStyle.Render("Fork:    "))
+				if quickForkKey != "" {
+					b.WriteString(keyStyle.Render(quickForkKey))
+					b.WriteString(hintStyle.Render(" quick fork"))
+				}
+				if quickForkKey != "" && forkWithOptionsKey != "" {
+					b.WriteString(hintStyle.Render(", "))
+				}
+				if forkWithOptionsKey != "" {
+					b.WriteString(keyStyle.Render(forkWithOptionsKey))
+					b.WriteString(hintStyle.Render(" fork with options"))
+				}
+				b.WriteString("\n")
+			}
 		}
 	}
 
@@ -8810,7 +10119,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 			// Fork hint for OpenCode
 			if selected.CanFork() {
-				renderForkHintLine(&b)
+				h.renderForkHintLine(&b)
 			}
 		} else {
 			// Check if detection has completed (OpenCodeDetectedAt is set even when no session found)
@@ -8843,7 +10152,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Custom tool info (tools defined in config.toml that aren't built-in)
-	if selected.Tool != "claude" && selected.Tool != "gemini" && selected.Tool != "opencode" &&
+	if !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
 		selected.Tool != "codex" {
 		if toolDef := session.GetToolDef(selected.Tool); toolDef != nil {
 			toolName := selected.Tool
@@ -8876,20 +10185,44 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 			// Resume hint when tool supports restart with session resume
 			if selected.CanRestartGeneric() {
-				hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
-				keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
-				b.WriteString(hintStyle.Render("Resume:  "))
-				b.WriteString(keyStyle.Render("r"))
-				b.WriteString(hintStyle.Render(" restart with session resume"))
-				b.WriteString("\n")
+				if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
+					hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+					keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+					b.WriteString(hintStyle.Render("Resume:  "))
+					b.WriteString(keyStyle.Render(restartKey))
+					b.WriteString(hintStyle.Render(" restart with session resume"))
+					b.WriteString("\n")
+				}
 			}
 		}
 	}
 
 	b.WriteString("\n")
 
-	// Special handling for error state - show guidance instead of output
-	if selected.Status == session.StatusError {
+	// Check preview settings for what to show
+	config, _ := session.LoadUserConfig()
+	showAnalytics := config != nil && config.GetShowAnalytics() &&
+		(session.IsClaudeCompatible(selected.Tool) || selected.Tool == "gemini")
+	showOutput := config == nil || config.GetShowOutput() // Default to true if config fails
+	showNotes := config == nil || config.GetShowNotes()   // Default to true if config fails
+	notesOutputSplit := 0.33
+	if config != nil {
+		notesOutputSplit = config.Preview.GetNotesOutputSplit()
+	}
+
+	// Apply preview mode override (v key cycles through modes)
+	switch h.previewMode {
+	case PreviewModeOutput:
+		showAnalytics = false
+		showOutput = true
+	case PreviewModeAnalytics:
+		// showAnalytics keeps its default value (only available for Claude/Gemini)
+		showOutput = false
+		// PreviewModeBoth: use config settings (default)
+	}
+
+	// Special handling for error/stopped state - show guidance instead of output
+	if selected.Status == session.StatusError || selected.Status == session.StatusStopped {
 		errorHeader := renderSectionDivider("Session Inactive", width-4)
 		b.WriteString(errorHeader)
 		b.WriteString("\n\n")
@@ -8911,14 +10244,18 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("Actions:"))
 		b.WriteString("\n")
-		b.WriteString("  ")
-		b.WriteString(keyStyle.Render("R"))
-		b.WriteString(dimStyle.Render(" Start   - create and start tmux session"))
-		b.WriteString("\n")
-		b.WriteString("  ")
-		b.WriteString(keyStyle.Render("d"))
-		b.WriteString(dimStyle.Render(" Delete  - remove from list"))
-		b.WriteString("\n")
+		if restartKey := h.actionKey(hotkeyRestart); restartKey != "" {
+			b.WriteString("  ")
+			b.WriteString(keyStyle.Render(restartKey))
+			b.WriteString(dimStyle.Render(" Start   - create and start tmux session"))
+			b.WriteString("\n")
+		}
+		if deleteKey := h.actionKey(hotkeyDelete); deleteKey != "" {
+			b.WriteString("  ")
+			b.WriteString(keyStyle.Render(deleteKey))
+			b.WriteString(dimStyle.Render(" Delete  - remove from list"))
+			b.WriteString("\n")
+		}
 		b.WriteString("  ")
 		b.WriteString(keyStyle.Render("Enter"))
 		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
@@ -8940,23 +10277,6 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		}
 
 		return content
-	}
-
-	// Check preview settings for what to show
-	config, _ := session.LoadUserConfig()
-	showAnalytics := config != nil && config.GetShowAnalytics() &&
-		(selected.Tool == "claude" || selected.Tool == "gemini")
-	showOutput := config == nil || config.GetShowOutput() // Default to true if config fails
-
-	// Apply preview mode override (v key cycles through modes)
-	switch h.previewMode {
-	case PreviewModeOutput:
-		showAnalytics = false
-		showOutput = true
-	case PreviewModeAnalytics:
-		// showAnalytics keeps its default value (only available for Claude/Gemini)
-		showOutput = false
-		// PreviewModeBoth: use config settings (default)
 	}
 
 	// Check if session is launching/resuming (for animation priority)
@@ -8991,11 +10311,22 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		}
 	}
 
+	remainingLines := height - (strings.Count(b.String(), "\n") + 1)
+	if showNotes {
+		notesLines := notesSectionLineBudget(remainingLines, showOutput || isStartingUp, notesOutputSplit)
+		if notesLines > 0 {
+			b.WriteString(h.renderNotesSection(selected, width, notesLines))
+			b.WriteString("\n")
+		}
+	}
+
 	// If output is disabled AND not starting up, return early
 	// (We want to show the launch animation even if output is normally disabled)
 	if !showOutput && !isStartingUp {
 		// If analytics was also not shown, display session info card as fallback
-		if !showAnalytics {
+		hasNotesContent := strings.TrimSpace(selected.Notes) != "" ||
+			(h.notesEditing && h.notesEditingSessionID == selected.ID)
+		if !showAnalytics && !hasNotesContent {
 			infoCard := h.renderSessionInfoCard(selected, width, height)
 			b.WriteString("\n")
 			b.WriteString(infoCard)
@@ -9063,13 +10394,13 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			if !sessionReady {
 				// Also check content for faster detection
 				h.previewCacheMu.RLock()
-				previewContent := h.previewCache[selected.ID]
+				previewContent := h.previewCache[pvKey]
 				h.previewCacheMu.RUnlock()
 
 				// Strip ANSI for reliable pattern matching
 				plainPreview := ansi.Strip(previewContent)
 
-				if selected.Tool == "claude" || selected.Tool == "gemini" {
+				if session.IsClaudeCompatible(selected.Tool) || selected.Tool == "gemini" {
 					// Claude/Gemini ready indicators
 					agentReady := strings.Contains(plainPreview, "ctrl+c to interrupt") ||
 						strings.Contains(plainPreview, "No, and tell Claude what to do differently") ||
@@ -9110,7 +10441,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 	// Terminal preview - use cached content (async fetching keeps View() pure)
 	h.previewCacheMu.RLock()
-	preview, hasCached := h.previewCache[selected.ID]
+	preview, hasCached := h.previewCache[pvKey]
 	h.previewCacheMu.RUnlock()
 
 	// Show forking animation when fork is in progress (highest priority)
@@ -9255,6 +10586,131 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	return strings.Join(truncatedLines, "\n")
 }
 
+func notesSectionLineBudget(remaining int, reserveOutput bool, split float64) int {
+	if remaining <= 0 {
+		return 0
+	}
+
+	if !reserveOutput {
+		return remaining
+	}
+
+	if split <= 0 {
+		split = 0.33
+	}
+
+	notesLines := int(float64(remaining) * split)
+	if notesLines < 3 {
+		notesLines = 3
+	}
+
+	maxNotes := remaining - 3
+	if maxNotes < 1 {
+		maxNotes = 1
+	}
+	if notesLines > maxNotes {
+		notesLines = maxNotes
+	}
+
+	return notesLines
+}
+
+func (h *Home) renderNotesSection(inst *session.Instance, width, maxLines int) string {
+	if inst == nil || maxLines <= 0 {
+		return ""
+	}
+	if maxLines < 2 {
+		maxLines = 2
+	}
+
+	contentWidth := width - 4
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
+	lines := make([]string, 0, maxLines)
+	lines = append(lines, renderSectionDivider("Notes", width-4))
+	bodyLines := maxLines - 1
+	if bodyLines < 1 {
+		bodyLines = 1
+	}
+
+	hintStyle := lipgloss.NewStyle().Foreground(ColorComment).Italic(true)
+	notesStyle := lipgloss.NewStyle().Foreground(ColorText)
+	emptyStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true)
+
+	if h.notesEditing && h.notesEditingSessionID == inst.ID {
+		editorLines := bodyLines - 1
+		if editorLines < 1 {
+			editorLines = 1
+		}
+
+		h.notesEditor.SetWidth(contentWidth)
+		h.notesEditor.SetHeight(editorLines)
+		h.notesEditor.Focus()
+
+		editorView := h.notesEditor.View()
+		viewLines := strings.Split(editorView, "\n")
+		if len(viewLines) > editorLines {
+			viewLines = viewLines[:editorLines]
+		}
+		for len(viewLines) < editorLines {
+			viewLines = append(viewLines, "")
+		}
+
+		for _, line := range viewLines {
+			lines = append(lines, ansi.Truncate(line, contentWidth, "..."))
+		}
+
+		lines = append(lines, hintStyle.Render("Ctrl+S save • Esc cancel"))
+	} else {
+		notesBodyLines := bodyLines - 1
+		if notesBodyLines < 1 {
+			notesBodyLines = 1
+		}
+
+		rawNotes := strings.TrimRight(inst.Notes, "\n")
+		rawLines := strings.Split(rawNotes, "\n")
+		if len(rawLines) == 1 && strings.TrimSpace(rawLines[0]) == "" {
+			rawLines = nil
+		}
+
+		if len(rawLines) == 0 {
+			lines = append(lines, emptyStyle.Render("No notes"))
+		} else {
+			overflow := len(rawLines) > notesBodyLines
+			displayLines := rawLines
+			if overflow {
+				displayLines = rawLines[:notesBodyLines]
+			}
+			for _, line := range displayLines {
+				safe := stripControlCharsPreserveANSI(line)
+				safe = runewidth.Truncate(safe, contentWidth, "...")
+				lines = append(lines, notesStyle.Render(safe))
+			}
+			if overflow && len(lines) > 0 {
+				more := len(rawLines) - notesBodyLines
+				lines[len(lines)-1] = hintStyle.Render(fmt.Sprintf("... +%d more lines", more))
+			}
+		}
+
+		hintText := "Notes hotkey unbound"
+		if editKey := h.actionKey(hotkeyEditNotes); editKey != "" {
+			hintText = fmt.Sprintf("%s edit notes", editKey)
+		}
+		lines = append(lines, hintStyle.Render(hintText))
+	}
+
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	for len(lines) < maxLines {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 // stripControlCharsPreserveANSI removes dangerous C0 control characters while
 // preserving ANSI escape sequences (ESC = 0x1b). This allows terminal colors
 // and formatting from capture-pane -e output to pass through to display, while
@@ -9375,7 +10831,7 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 			waiting++
 		case session.StatusIdle:
 			idle++
-		case session.StatusError:
+		case session.StatusError, session.StatusStopped:
 			errored++
 		}
 	}
@@ -9471,6 +10927,8 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 				statusIcon, statusColor = "◐", ColorYellow
 			case session.StatusError:
 				statusIcon, statusColor = "✕", ColorRed
+			case session.StatusStopped:
+				statusIcon, statusColor = "■", ColorTextDim
 			}
 			status := lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon)
 			name := lipgloss.NewStyle().Foreground(ColorText).Render(sess.Title)
@@ -9483,7 +10941,17 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 	// Keyboard hints at bottom
 	b.WriteString("\n")
 	hintStyle := lipgloss.NewStyle().Foreground(ColorComment).Italic(true)
-	b.WriteString(hintStyle.Render("Tab toggle • R rename • d delete • g subgroup"))
+	hints := []string{"Tab toggle"}
+	if key := h.actionKey(hotkeyRename); key != "" {
+		hints = append(hints, key+" rename")
+	}
+	if key := h.actionKey(hotkeyDelete); key != "" {
+		hints = append(hints, key+" delete")
+	}
+	if key := h.actionKey(hotkeyCreateGroup); key != "" {
+		hints = append(hints, key+" subgroup")
+	}
+	b.WriteString(hintStyle.Render(strings.Join(hints, " • ")))
 
 	// CRITICAL: Enforce width constraint on ALL lines to prevent overflow into left panel
 	maxWidth := max(width-2, 20)
@@ -9858,14 +11326,15 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 	}
 }
 
-// getOtherActiveSessions returns sessions excluding the given ID and error-status sessions.
+// getOtherActiveSessions returns sessions excluding the given ID and error/stopped-status sessions.
 func (h *Home) getOtherActiveSessions(excludeID string) []*session.Instance {
 	var result []*session.Instance
 	for _, inst := range h.instances {
 		if inst.ID == excludeID {
 			continue
 		}
-		if inst.GetStatusThreadSafe() == session.StatusError {
+		s := inst.GetStatusThreadSafe()
+		if s == session.StatusError || s == session.StatusStopped {
 			continue
 		}
 		result = append(result, inst)

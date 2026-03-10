@@ -5,6 +5,91 @@ All notable changes to Agent Deck will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.24.1] - 2026-03-07
+
+### Fixed
+- Restore instant preview rendering from cached content during session navigation and immediately after returning from an attached session, removing placeholder delays introduced in `0.24.0`.
+
+## [0.24.0] - 2026-03-07
+
+### Added
+- Add `internal/send` package consolidating all send verification functions (prompt detection, composer parsing, unsent-prompt checks) into a single location.
+- Add Codex readiness detection: `waitForAgentReady` and `sendMessageWhenReady` now gate on `codex>` prompt before delivering messages to Codex sessions.
+- Add session death detection in `--wait` mode: `waitForCompletion` detects 5 consecutive status errors and returns exit code 1 instead of hanging indefinitely.
+- Add heartbeat migration function (`MigrateConductorHeartbeatScripts`) that auto-refreshes installed scripts to the latest template.
+- Add exit 137 (SIGKILL) investigation report documenting root cause as Claude Code limitation with reproduction steps and mitigation strategies.
+- Add exit 137 mitigation guidance to shared conductor CLAUDE.md and GSD conductor SKILL.md.
+- Promote 27 validated conductor learnings to shared docs: 10 universal orchestration patterns to conductor CLAUDE.md, 6 GSD-specific learnings to gsd-conductor SKILL.md, 11 operational patterns to agent-deck-workflow SKILL.md.
+
+### Fixed
+- Harden Enter retry loop: retry every iteration for first 5 attempts (previously every 3rd), increasing ambiguous budget from 2 to 4.
+- Scope heartbeat scripts to conductor's own group instead of broadcasting to all sessions in the profile.
+- Honor `heartbeat_interval = 0` as disabled: skip heartbeat daemon installation during conductor setup.
+- Add enabled-status guard to heartbeat scripts so they exit silently when conductor is disabled.
+- Fix `-c` and `-g` flag co-parsing so both flags work together in `agent-deck add`.
+- Improve `--no-parent` help text to reference `set-parent` for later parent linking.
+
+### Changed
+- Clean up all six conductor LEARNINGS.md files: mark promoted entries, remove retired entries, consolidate duplicates.
+
+## [0.23.0] - 2026-03-07
+
+### Added
+- Add status detection integration tests: real tmux status transition cycles, pattern detection, and tool config verification.
+- Add conductor pipeline integration tests: send-to-child delivery, cross-session event write-watch, heartbeat round-trips, and chunked send delivery.
+- Add edge case integration tests: skills discover-attach verification.
+- Complete milestone v1.1 Integration Testing (38 integration tests across 6 phases).
+
+### Fixed
+- Handle nested binary paths in release tarballs so self-update works with both flat and directory-wrapped archives.
+
+## [0.22.0] - 2026-03-06
+
+### Added
+- Add integration test framework: TmuxHarness (auto-cleanup real tmux sessions), polling helpers (WaitForCondition, WaitForPaneContent, WaitForStatus), and SQLite fixture helpers (NewTestDB, InstanceBuilder).
+- Add session lifecycle integration tests (start, stop, fork, restart) using real tmux sessions with automatic cleanup.
+- Add session lifecycle unit tests covering start, stop, fork, and attach operations with tmux verification.
+- Add status lifecycle tests for sleep/wake detection and SQLite persistence round-trips.
+- Add skills runtime tests verifying on-demand skill loading, pool skill discovery, and project skill application.
+
+### Changed
+- Reformat agent-deck and session-share SKILL.md files to official Anthropic skill-creator format with proper frontmatter.
+- Add $SKILL_DIR path resolution to session-share skill for plugin cache compatibility.
+- Register session-share skill in marketplace.json for independent discoverability.
+- Update GSD conductor skill content in pool directory with current lifecycle documentation.
+
+## [0.21.1] - 2026-03-06
+
+### Fixed
+
+- Propagate forked `AGENTDECK_INSTANCE_ID` values correctly so Claude hook subprocesses update the child session instead of the parent.
+- Fully honor `[tmux].inject_status_line = false` by skipping tmux notification/status-line mutations when status injection is disabled.
+- Add Gemini `--yolo` CLI overrides for `agent-deck add`, `agent-deck session start`, and TUI session creation.
+- Clamp final TUI frames to the terminal viewport so navigation cannot spill duplicate footer/help rows into scrollback.
+
+## [0.21.0] - 2026-03-06
+
+### Added
+
+- Add built-in Pi tool support, configurable hotkeys, session notes in the preview pane, and optional follow-CWD-on-attach behavior in the TUI.
+- Add OpenClaw gateway integration with sync, status, list, send, and bridge commands for managing OpenClaw agents as agent-deck sessions.
+- Add per-window tmux tracking in the session list with direct window navigation and AI tool badges.
+- Add remote session creation from the TUI (`n`/`N` on remote groups and remote sessions).
+- Add remote binary management with automatic install during `agent-deck remote add` and the new `agent-deck remote update` command.
+- Add configurable `[worktree].branch_prefix` for new worktree sessions.
+- Add Vimium-style jump mode for session-list navigation.
+
+### Changed
+
+- Significantly reduce TUI lag during navigation, attach/return flows, preview rendering, and background status refreshes.
+
+### Fixed
+
+- Enable Claude-specific session management features for custom tools that wrap the `claude` binary.
+- Prevent non-interactive installs from hanging when `tmux` is missing by skipping interactive prompts and failing fast when `sudo` would block.
+
 ## [0.20.2] - 2026-03-03
 
 ### Fixed

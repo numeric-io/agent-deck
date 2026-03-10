@@ -536,6 +536,7 @@ func TestDetectToolFromCommand(t *testing.T) {
 		{name: "gemini", command: "gemini --yolo", want: "gemini"},
 		{name: "opencode", command: "open-code --continue", want: "opencode"},
 		{name: "codex", command: "codex --dangerously-bypass-approvals-and-sandbox", want: "codex"},
+		{name: "pi", command: "pi --model fast", want: "pi"},
 		{name: "shell command", command: "npm run dev", want: ""},
 		{name: "empty", command: "", want: ""},
 	}
@@ -572,6 +573,12 @@ Do you trust the files in this folder?`,
 			content: `No, and tell Claude what to do differently
 Yes, allow once`,
 			want: "claude",
+		},
+		{
+			name: "pi prompt detects pi",
+			content: `Welcome to Pi CLI
+pi> `,
+			want: "pi",
 		},
 	}
 
@@ -2517,4 +2524,31 @@ func TestSplitIntoChunks_SplitsAtNewlineBoundary(t *testing.T) {
 	// First chunk should contain exactly 2 lines (4002 bytes), split at newline
 	assert.Equal(t, line+line, chunks[0])
 	assert.Equal(t, line, chunks[1])
+}
+
+func TestParseWindowCacheFromListWindows(t *testing.T) {
+	// Simulate list-windows output with extended format
+	lines := []string{
+		"agentdeck_proj_abc12345\t1704067200\t0\tmain",
+		"agentdeck_proj_abc12345\t1704067300\t1\ttests",
+		"agentdeck_other_def67890\t1704067100\t0\tbash",
+	}
+
+	sessionCache, windowCache := parseListWindowsOutput(strings.Join(lines, "\n"))
+
+	// Session cache: max activity per session
+	assert.Equal(t, int64(1704067300), sessionCache["agentdeck_proj_abc12345"])
+	assert.Equal(t, int64(1704067100), sessionCache["agentdeck_other_def67890"])
+
+	// Window cache: per-window entries
+	assert.Len(t, windowCache["agentdeck_proj_abc12345"], 2)
+	assert.Equal(t, "main", windowCache["agentdeck_proj_abc12345"][0].Name)
+	assert.Equal(t, 1, windowCache["agentdeck_proj_abc12345"][1].Index)
+	assert.Len(t, windowCache["agentdeck_other_def67890"], 1)
+}
+
+func TestParseWindowCacheEmptyInput(t *testing.T) {
+	sessionCache, windowCache := parseListWindowsOutput("")
+	assert.Empty(t, sessionCache)
+	assert.Empty(t, windowCache)
 }
