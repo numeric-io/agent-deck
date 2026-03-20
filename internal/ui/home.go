@@ -4242,8 +4242,8 @@ func (h *Home) getCurrentGroupPath() string {
 
 // handleNewDialogKey handles keys when new dialog is visible
 func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// When the recent sessions picker is open, let the dialog handle all keys first.
-	if h.newDialog.IsRecentPickerOpen() {
+	// When the recent sessions picker or path dropdown is open, let the dialog handle all keys first.
+	if h.newDialog.IsRecentPickerOpen() || h.newDialog.IsPathDropdownOpen() {
 		var cmd tea.Cmd
 		h.newDialog, cmd = h.newDialog.Update(msg)
 		return h, cmd

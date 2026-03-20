@@ -9,6 +9,7 @@ type OptionsPanel interface {
 	Blur()
 	IsFocused() bool
 	AtTop() bool
+	AtBottom() bool
 	Update(tea.Msg) tea.Cmd
 	View() string
 }

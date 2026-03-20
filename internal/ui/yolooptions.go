@@ -52,6 +52,11 @@ func (p *YoloOptionsPanel) AtTop() bool {
 	return true
 }
 
+// AtBottom returns true (single element, always at bottom).
+func (p *YoloOptionsPanel) AtBottom() bool {
+	return true
+}
+
 // Update handles key events.
 func (p *YoloOptionsPanel) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {

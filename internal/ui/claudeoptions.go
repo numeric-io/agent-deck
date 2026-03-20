@@ -114,6 +114,11 @@ func (p *ClaudeOptionsPanel) AtTop() bool {
 	return p.focusIndex <= 0
 }
 
+// AtBottom returns true if focus is on the last element
+func (p *ClaudeOptionsPanel) AtBottom() bool {
+	return p.focusIndex >= p.getFocusCount()-1
+}
+
 // GetOptions returns current options as ClaudeOptions
 func (p *ClaudeOptionsPanel) GetOptions() *session.ClaudeOptions {
 	opts := &session.ClaudeOptions{
@@ -143,7 +148,7 @@ func (p *ClaudeOptionsPanel) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "up":
+		case "up", "ctrl+p":
 			p.focusIndex--
 			if p.focusIndex < 0 {
 				p.focusIndex = p.getFocusCount() - 1
@@ -151,7 +156,7 @@ func (p *ClaudeOptionsPanel) Update(msg tea.Msg) tea.Cmd {
 			p.updateInputFocus()
 			return nil
 
-		case "down", "tab":
+		case "down", "tab", "ctrl+n":
 			p.focusIndex++
 			if p.focusIndex >= p.getFocusCount() {
 				p.focusIndex = 0

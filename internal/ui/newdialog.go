@@ -71,6 +71,8 @@ type NewDialog struct {
 	pathSuggestionCursor int      // tracks selected suggestion in dropdown.
 	suggestionNavigated  bool     // tracks if user explicitly navigated suggestions.
 	pathSoftSelected     bool     // true when path text is "soft selected" (ready to replace on type).
+	pathDropdownOpen     bool     // true when the path suggestions dropdown is expanded.
+	pathDropdownFilter   string   // independent filter text for the dropdown (not the path input).
 	// Worktree support.
 	worktreeEnabled bool
 	branchInput     textinput.Model
@@ -213,6 +215,8 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.nameInput.Focus()
 	d.suggestionNavigated = false // reset on show
 	d.pathSuggestionCursor = 0    // reset cursor too
+	d.pathDropdownOpen = false    // start with dropdown collapsed
+	d.pathDropdownFilter = ""     // clear filter
 	d.pathCycler.Reset()          // clear stale autocomplete matches from previous show
 	d.showRecentPicker = false    // reset recent picker
 	d.recentSessionCursor = 0
@@ -304,19 +308,36 @@ func (d *NewDialog) SetSize(width, height int) {
 
 // SetPathSuggestions sets the available path suggestions for autocomplete.
 // Paths are shortened to use ~ for the home directory prefix.
+// Paths containing a .worktrees directory component are sorted to the bottom.
 func (d *NewDialog) SetPathSuggestions(paths []string) {
 	shortened := make([]string, len(paths))
 	for i, p := range paths {
 		shortened[i] = shortenHome(p)
 	}
-	d.allPathSuggestions = shortened
-	d.pathSuggestions = shortened
+	// Stable partition: non-worktree paths first, then worktree paths.
+	normal := make([]string, 0, len(shortened))
+	worktree := make([]string, 0)
+	for _, p := range shortened {
+		if strings.Contains(p, ".worktrees/") || strings.Contains(p, ".worktrees"+string(os.PathSeparator)) {
+			worktree = append(worktree, p)
+		} else {
+			normal = append(normal, p)
+		}
+	}
+	sorted := append(normal, worktree...)
+	d.allPathSuggestions = sorted
+	d.pathSuggestions = sorted
 	d.pathSuggestionCursor = 0
 }
 
 // IsRecentPickerOpen returns whether the recent sessions picker is visible.
 func (d *NewDialog) IsRecentPickerOpen() bool {
 	return d.showRecentPicker && len(d.recentSessions) > 0
+}
+
+// IsPathDropdownOpen returns whether the path suggestions dropdown is expanded.
+func (d *NewDialog) IsPathDropdownOpen() bool {
+	return d.pathDropdownOpen
 }
 
 // SetRecentSessions sets the list of recently deleted session configs.
@@ -433,9 +454,9 @@ func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 	d.rebuildFocusTargets()
 }
 
-// filterPathSuggestions filters allPathSuggestions by the current path input value
+// filterPathSuggestions filters allPathSuggestions by the dropdown filter text.
 func (d *NewDialog) filterPathSuggestions() {
-	query := strings.ToLower(strings.TrimSpace(d.pathInput.Value()))
+	query := strings.ToLower(strings.TrimSpace(d.pathDropdownFilter))
 	if query == "" {
 		d.pathSuggestions = d.allPathSuggestions
 	} else {
@@ -680,6 +701,11 @@ func (d *NewDialog) updateFocus() {
 	d.geminiOptions.Blur()
 	d.codexOptions.Blur()
 
+	// Collapse path dropdown when leaving the path field.
+	if d.currentTarget() != focusPath {
+		d.pathDropdownOpen = false
+	}
+
 	// Manage soft-select: re-activate when entering path field with a value.
 	d.pathSoftSelected = false
 	switch d.currentTarget() {
@@ -761,25 +787,76 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 		}
 
+		// Path dropdown handling — acts as its own mini-mode with independent filter.
+		if d.pathDropdownOpen {
+			switch msg.String() {
+			case "ctrl+n", "down":
+				if len(d.pathSuggestions) > 0 {
+					d.pathSuggestionCursor = (d.pathSuggestionCursor + 1) % len(d.pathSuggestions)
+					d.suggestionNavigated = true
+				}
+				return d, nil
+			case "ctrl+p", "up":
+				if len(d.pathSuggestions) > 0 {
+					d.pathSuggestionCursor--
+					if d.pathSuggestionCursor < 0 {
+						d.pathSuggestionCursor = len(d.pathSuggestions) - 1
+					}
+					d.suggestionNavigated = true
+				}
+				return d, nil
+			case "enter":
+				// Select the current suggestion into the path input.
+				if len(d.pathSuggestions) > 0 && d.pathSuggestionCursor < len(d.pathSuggestions) {
+					d.pathInput.SetValue(d.pathSuggestions[d.pathSuggestionCursor])
+					d.pathInput.SetCursor(len(d.pathInput.Value()))
+					d.pathSoftSelected = true
+				}
+				d.pathDropdownOpen = false
+				d.pathDropdownFilter = ""
+				return d, nil
+			case "esc":
+				// Close dropdown without modifying path input.
+				d.pathDropdownOpen = false
+				d.pathDropdownFilter = ""
+				d.suggestionNavigated = false
+				return d, nil
+			default:
+				// Route typing to the dropdown filter.
+				switch msg.Type {
+				case tea.KeyRunes:
+					d.pathDropdownFilter += string(msg.Runes)
+					d.pathSuggestionCursor = 0
+					d.suggestionNavigated = false
+					d.filterPathSuggestions()
+				case tea.KeyBackspace:
+					if len(d.pathDropdownFilter) > 0 {
+						d.pathDropdownFilter = d.pathDropdownFilter[:len(d.pathDropdownFilter)-1]
+						d.pathSuggestionCursor = 0
+						d.suggestionNavigated = false
+						d.filterPathSuggestions()
+					}
+				}
+				return d, nil // Consume all other keys while dropdown is open.
+			}
+		}
+
 		// Soft-select interception for path field
 		if d.focusIndex == 1 && d.pathSoftSelected {
 			switch msg.Type {
 			case tea.KeyRunes:
-				// Printable char: clear field, focus textinput, let rune fall through
+				// Printable char: exit soft-select, keep value, cursor at end, let rune append
 				d.pathSoftSelected = false
-				d.pathInput.SetValue("")
-				d.pathInput.SetCursor(0)
 				d.pathInput.Focus()
+				d.pathInput.SetCursor(len(d.pathInput.Value()))
 				d.pathCycler.Reset()
 				// DON'T return — let the rune reach textinput.Update() below
 			case tea.KeyBackspace, tea.KeyDelete:
 				d.pathSoftSelected = false
-				d.pathInput.SetValue("")
-				d.pathInput.SetCursor(0)
 				d.pathInput.Focus()
+				d.pathInput.SetCursor(len(d.pathInput.Value()))
 				d.pathCycler.Reset()
-				d.filterPathSuggestions()
-				return d, nil // consume the key
+				// DON'T return — let backspace reach textinput.Update() to delete from end
 			case tea.KeyLeft, tea.KeyRight:
 				d.pathSoftSelected = false
 				d.pathInput.Focus() // exit soft-select, allow editing
@@ -796,7 +873,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.updateFocus()
 				return d, nil
 			}
-			// On path field: trigger directory autocomplete or cycle suggestions.
+			// On path field: trigger directory autocomplete.
 			if cur == focusPath {
 				path := d.pathInput.Value()
 				expanded := session.ExpandPath(path) // expand ~ for os.Stat / completions
@@ -821,23 +898,18 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 						return d, nil
 					}
 				}
-				// Cycle forward through path suggestions.
-				if len(d.pathSuggestions) > 0 {
-					d.pathSoftSelected = false
-					d.pathInput.Focus()
-					d.pathSuggestionCursor = (d.pathSuggestionCursor + 1) % len(d.pathSuggestions)
-					d.suggestionNavigated = true
-				}
 			}
 			return d, nil
 
 		case "down", "ctrl+n":
-			if d.focusIndex < maxIdx {
-				d.focusIndex++
-				d.updateFocus()
-			} else if cur == focusOptions && d.toolOptions != nil {
+			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtBottom() {
 				return d, d.toolOptions.Update(msg)
 			}
+			d.focusIndex++
+			if d.focusIndex > maxIdx {
+				d.focusIndex = 0
+			}
+			d.updateFocus()
 			return d, nil
 
 		case "shift+tab":
@@ -850,16 +922,6 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.updateToolOptions()
 				d.updateFocus()
 				return d, nil
-			}
-			// On path field: cycle backward through path suggestions.
-			if cur == focusPath && len(d.pathSuggestions) > 0 {
-				d.pathSoftSelected = false
-				d.pathInput.Focus()
-				d.pathSuggestionCursor--
-				if d.pathSuggestionCursor < 0 {
-					d.pathSuggestionCursor = len(d.pathSuggestions) - 1
-				}
-				d.suggestionNavigated = true
 			}
 			return d, nil
 
@@ -879,14 +941,14 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "enter":
-			// On path field with navigated suggestion: apply it and stay.
-			if cur == focusPath && d.suggestionNavigated && len(d.pathSuggestions) > 0 {
-				if d.pathSuggestionCursor < len(d.pathSuggestions) {
-					d.pathInput.SetValue(d.pathSuggestions[d.pathSuggestionCursor])
-					d.pathInput.SetCursor(len(d.pathInput.Value()))
-					d.pathSoftSelected = true
-					d.suggestionNavigated = false
-				}
+			if cur == focusPath && !d.pathDropdownOpen && len(d.allPathSuggestions) > 0 {
+				// Open dropdown with fresh filter.
+				d.pathDropdownOpen = true
+				d.pathDropdownFilter = ""
+				d.pathSuggestionCursor = 0
+				d.suggestionNavigated = false
+				d.filterPathSuggestions()
+				return d, nil
 			}
 			return d, nil
 
@@ -1138,7 +1200,14 @@ func (d *NewDialog) View() string {
 
 	// Path input
 	if cur == focusPath {
-		content.WriteString(activeLabelStyle.Render("▶ Path:"))
+		if d.pathDropdownOpen {
+			content.WriteString(activeLabelStyle.Render("▶ Path:"))
+		} else if len(d.pathSuggestions) > 0 {
+			content.WriteString(activeLabelStyle.Render("▶ Path:"))
+			content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Render("  (Enter: browse recent)"))
+		} else {
+			content.WriteString(activeLabelStyle.Render("▶ Path:"))
+		}
 	} else {
 		content.WriteString(labelStyle.Render("  Path:"))
 	}
@@ -1155,8 +1224,8 @@ func (d *NewDialog) View() string {
 	}
 	content.WriteString("\n")
 
-	// Show path suggestions dropdown when path field is focused
-	if d.focusIndex == 1 && len(d.pathSuggestions) > 0 {
+	// Show path suggestions dropdown when explicitly expanded via Enter
+	if d.pathDropdownOpen && len(d.pathSuggestions) > 0 {
 		suggestionStyle := lipgloss.NewStyle().
 			Foreground(ColorComment)
 		selectedStyle := lipgloss.NewStyle().
@@ -1183,15 +1252,23 @@ func (d *NewDialog) View() string {
 			}
 		}
 
-		var headerText string
-		if len(d.pathSuggestions) < len(d.allPathSuggestions) {
-			headerText = fmt.Sprintf("─ recent paths (%d/%d matching, ^N/^P: cycle, Tab: accept) ─",
-				len(d.pathSuggestions), len(d.allPathSuggestions))
-		} else {
-			headerText = "─ recent paths (^N/^P: cycle, Tab: accept) ─"
-		}
+		headerText := "─ recent paths (^N/^P: navigate, Enter: select, Esc: cancel) ─"
 		content.WriteString("  ")
 		content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Render(headerText))
+		content.WriteString("\n")
+
+		// Show filter input.
+		filterDisplay := d.pathDropdownFilter
+		if filterDisplay == "" {
+			filterDisplay = "type to filter..."
+			content.WriteString("  ")
+			content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Italic(true).Render("  "+filterDisplay))
+		} else {
+			matchInfo := fmt.Sprintf(" (%d/%d)", len(d.pathSuggestions), len(d.allPathSuggestions))
+			content.WriteString("  ")
+			content.WriteString(lipgloss.NewStyle().Foreground(ColorCyan).Render("  "+filterDisplay))
+			content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Render(matchInfo))
+		}
 		content.WriteString("\n")
 
 		// Show "more above" indicator
